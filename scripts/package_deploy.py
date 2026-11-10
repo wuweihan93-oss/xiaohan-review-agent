@@ -10,7 +10,7 @@ from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
 FILES = ["README.md", "pyproject.toml", "uv.lock", ".python-version", ".env.example", ".gitignore", ".dockerignore", "compose.yaml"]
-DIRECTORIES = ["backend/app", "backend/tests", "frontend/src", "deploy", "scripts"]
+DIRECTORIES = ["backend/app", "backend/tests", "frontend/src", "frontend/tests", ".github/workflows", "deploy", "scripts"]
 EXTRA_FILES = [
     "backend/pyproject.toml", "backend/uv.lock", "frontend/package.json",
     "frontend/package-lock.json", "frontend/index.html", "frontend/vite.config.js",

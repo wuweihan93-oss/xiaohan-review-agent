@@ -27,6 +27,8 @@ npm run dev
 
 已提供 `compose.yaml`、前后端 Dockerfile 与 Nginx 配置。按 [部署说明](deploy/部署说明.md) 上传部署包和 `.env`，在 Ubuntu 执行 `docker compose up -d --build`。Python 与 Node 依赖会按锁文件重新安装，资料库和上传文件通过 `runtime/` 持久化，对话继续使用现有 PostgreSQL。
 
+首次部署成功后，可按 [CI/CD 配置指南](deploy/CI-CD配置指南.md) 配置 GitHub Actions。推送 `main` 后自动测试、构建 Linux 镜像，并通过 SSH 传到服务器更新容器；部署失败时尝试恢复上一版。模型与数据库密钥继续只放在服务器 `.env`。
+
 ## 使用方式
 
 1. 在“学习资料”导入 `langchain_tutorial` 中的教程，或上传自己的 PDF、DOCX、Markdown、TXT、Python 文件和 notebook。

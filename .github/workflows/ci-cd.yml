@@ -1,0 +1,153 @@
+name: 小晗 CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支的部署依次完成，避免取消正在更新容器的任务。
+concurrency:
+  group: xiaohan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: 测试后端、数据库和前端
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: xiaohan_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d xiaohan_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # 只连接本次 CI 的临时数据库，不需要任何线上密钥。
+      DB_URL: postgresql://postgres:postgres@127.0.0.1:5432/xiaohan_ci?sslmode=disable
+      XIAOHAN_POSTGRES_TESTS: '1'
+      LANGSMITH_TRACING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.13.6'
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - name: 安装后端锁定依赖
+        working-directory: backend
+        run: uv sync --frozen --no-dev
+      - name: 运行后端与 PostgreSQL 集成测试
+        working-directory: backend
+        run: uv run --frozen python -m unittest discover -s tests -v
+      - name: 验证部署成功与失败回退流程
+        run: |
+          bash -n scripts/deploy_via_ssh.sh deploy/apply-release.sh
+          python -m unittest discover -s scripts/tests -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 前端兼容性测试与构建
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+  build:
+    name: 构建 Linux 镜像
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: 构建后端镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/backend.Dockerfile
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          tags: xiaohan-review-backend:${{ github.sha }}
+          build-args: |
+            DEBIAN_MIRROR=https://deb.debian.org
+            PYPI_INDEX=https://pypi.org/simple
+          cache-from: type=gha,scope=xiaohan-backend
+          cache-to: type=gha,mode=max,scope=xiaohan-backend
+      - name: 构建前端镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/frontend.Dockerfile
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          tags: xiaohan-review-frontend:${{ github.sha }}
+          cache-from: type=gha,scope=xiaohan-frontend
+          cache-to: type=gha,mode=max,scope=xiaohan-frontend
+      - name: 打包镜像和部署文件
+        if: github.event_name != 'pull_request'
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/xiaohan-release"
+          docker save -o "$RUNNER_TEMP/xiaohan-release/images.tar" \
+            "xiaohan-review-backend:$REVISION" "xiaohan-review-frontend:$REVISION"
+          cp compose.yaml "$RUNNER_TEMP/xiaohan-release/compose.yaml"
+          cp deploy/apply-release.sh "$RUNNER_TEMP/xiaohan-release/apply-release.sh"
+          printf '%s\n' "$REVISION" > "$RUNNER_TEMP/xiaohan-release/REVISION"
+          mkdir -p dist-release
+          tar -C "$RUNNER_TEMP/xiaohan-release" -cf - . | gzip -1 > dist-release/xiaohan-release.tar.gz
+          cd dist-release
+          sha256sum xiaohan-release.tar.gz > xiaohan-release.tar.gz.sha256
+      - name: 保存部署包
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaohan-release-${{ github.sha }}
+          path: dist-release/
+          compression-level: 0
+          retention-days: 2
+
+  deploy:
+    name: 更新 Ubuntu 服务
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xiaohan-release-${{ github.sha }}
+          path: dist-release
+      - name: 通过 SSH 传输镜像并部署
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/home/ubuntu/apps/xiaohan-review-agent' }}
+          REVISION: ${{ github.sha }}
+        run: bash scripts/deploy_via_ssh.sh dist-release/xiaohan-release.tar.gz

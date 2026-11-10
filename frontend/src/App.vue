@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { createId } from './id.js'
 import {
   ArrowDownToLine,
   BookOpen,
@@ -40,7 +41,7 @@ const materials = ref([])
 const savedConversationId = localStorage.getItem('xiaohan-conversation')
 const selectedIds = ref(new Set(storedJson('xiaohan-selected-materials', [])))
 const messages = ref(storedJson('xiaohan-messages', []))
-const conversationId = ref(savedConversationId || crypto.randomUUID())
+const conversationId = ref(savedConversationId || createId())
 const conversations = ref([])
 const historyTotal = ref(0)
 const historyLoading = ref(false)
@@ -260,7 +261,7 @@ async function ask(text = question.value) {
   error.value = ''
   notice.value = ''
   question.value = ''
-  const userMessage = { role: 'user', content: value, id: crypto.randomUUID() }
+  const userMessage = { role: 'user', content: value, id: createId() }
   messages.value.push(userMessage)
   loading.value = true
   await scrollToEnd()
@@ -285,11 +286,11 @@ async function ask(text = question.value) {
       content: result.answer,
       sources: result.sources,
       trace: result.trace,
-      id: crypto.randomUUID(),
+      id: createId(),
     })
   } catch (caught) {
     error.value = caught.message
-    messages.value.push({ role: 'assistant', content: `这次复习没有完成：${caught.message}`, failed: true, id: crypto.randomUUID() })
+    messages.value.push({ role: 'assistant', content: `这次复习没有完成：${caught.message}`, failed: true, id: createId() })
   } finally {
     await loadHistory()
     loading.value = false
@@ -306,7 +307,7 @@ function startQuiz() {
 function newConversation() {
   if (busy.value) return
   messages.value = []
-  conversationId.value = crypto.randomUUID()
+  conversationId.value = createId()
   activeConversationTitle.value = ''
   activePage.value = 'review'
   question.value = ''
