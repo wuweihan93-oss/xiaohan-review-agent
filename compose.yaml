@@ -1,0 +1,36 @@
+name: xiaohan-review
+
+services:
+  backend:
+    image: xiaohan-review-backend:1.0
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 这些值覆盖 Mac .env 里的本机路径；密钥只通过运行时环境注入。
+      XIAOHAN_MILVUS_URI: /app/backend/data/xiaohan.db
+      TUTORIAL_DIR: /app/tutorial
+      API_BASE_URL: http://127.0.0.1:8010
+    volumes:
+      - ./runtime/data:/app/backend/data
+      - ./runtime/uploads:/app/backend/uploads
+      - ./runtime/tutorial:/app/tutorial:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    expose:
+      - "8010"
+
+  frontend:
+    image: xiaohan-review-frontend:1.0
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${XIAOHAN_BIND_HOST:-127.0.0.1}:${XIAOHAN_HTTP_PORT:-8888}:80"
