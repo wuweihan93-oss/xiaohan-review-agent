@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { createId } from './id.js'
 import {
   ArrowDownToLine,
+  ArrowUp,
   BookOpen,
   Check,
   CheckCheck,
@@ -12,14 +13,12 @@ import {
   File,
   FileCode2,
   FileText,
-  GraduationCap,
   History,
   Layers3,
   LoaderCircle,
   Menu,
   MessageCircleMore,
   Plus,
-  Send,
   Sparkles,
   Trash2,
   Upload,
@@ -60,6 +59,7 @@ const deletingId = ref('')
 const error = ref('')
 const notice = ref('')
 const mobileNav = ref(false)
+const evidenceOpen = ref(false)
 const chatBody = ref(null)
 const fileInput = ref(null)
 
@@ -380,7 +380,7 @@ onMounted(initialize)
 
     <main class="main-area">
       <header class="topbar">
-        <div class="topbar-left"><button class="icon-button mobile-menu" aria-label="打开导航" @click="mobileNav = true"><Menu :size="18" /></button><span>小晗带你复习</span><span class="crumb-slash">/</span><strong>{{ activePage === 'materials' ? '学习资料' : '复盘学习' }}</strong></div>
+        <div class="topbar-left"><button class="icon-button mobile-menu" aria-label="打开导航" @click="mobileNav = true"><Menu :size="18" /></button><h1 class="topbar-title" :title="activePage === 'materials' ? '学习资料' : currentTitle">{{ activePage === 'materials' ? '学习资料' : currentTitle }}</h1></div>
         <div class="topbar-right"><span class="connection"><span class="model-dot" :class="{ ready: health.model_configured }"></span>{{ health.model_configured ? 'DeepSeek 已连接' : '模型未连接' }}</span><button v-if="activePage === 'review'" class="new-session" :disabled="busy" @click="newConversation"><Plus :size="15" /> 新复习</button></div>
       </header>
 
@@ -422,13 +422,13 @@ onMounted(initialize)
       </section>
 
       <section v-else class="review-page">
-        <div class="review-toolbar">
-          <div class="review-title"><div class="page-kicker"><GraduationCap :size="14" /> 复盘学习</div><h1 :title="currentTitle">{{ currentTitle }}</h1></div>
-          <div class="mode-control" role="tablist" aria-label="学习模式"><button :disabled="busy" :class="{ active: mode === 'coach' }" :aria-selected="mode === 'coach'" @click="changeMode('coach')"><Sparkles :size="14" />带我复盘</button><button :disabled="busy" :class="{ active: mode === 'quiz' }" :aria-selected="mode === 'quiz'" @click="changeMode('quiz')"><CheckCheck :size="14" />抽查我</button></div>
+        <div class="review-toolbar" aria-label="复习设置">
+          <div class="mode-control" role="group" aria-label="学习模式"><button :disabled="busy" :class="{ active: mode === 'coach' }" :aria-pressed="mode === 'coach'" @click="changeMode('coach')"><Sparkles :size="14" />带我复盘</button><button :disabled="busy" :class="{ active: mode === 'quiz' }" :aria-pressed="mode === 'quiz'" @click="changeMode('quiz')"><CheckCheck :size="14" />抽查我</button></div>
+          <button class="material-scope" :title="selectedCount ? selectedMaterials.map((item) => item.title).join('、') : '选择本轮学习资料'" @click="activePage = 'materials'"><BookOpen :size="14" /><span>{{ selectedCount ? `${selectedCount} 份资料` : '选择资料' }}</span><ChevronDown :size="12" /></button>
+          <button class="evidence-toggle" :aria-expanded="evidenceOpen" aria-controls="review-evidence-panel" @click="evidenceOpen = !evidenceOpen"><Layers3 :size="14" /><span>依据</span><ChevronDown :size="12" :class="{ 'chevron-open': evidenceOpen }" /></button>
         </div>
 
         <div v-if="notice" class="notice-line"><CircleCheck :size="15" /><span>{{ notice }}</span><button aria-label="关闭提示" @click="notice = ''"><X :size="14" /></button></div>
-        <div class="review-context"><div class="context-left"><BookOpen :size="15" /><span>本轮资料</span><strong>{{ selectedCount ? `${selectedCount} 份` : '未选择' }}</strong><span v-if="selectedCount" class="context-materials">{{ selectedMaterials.slice(0, 2).map((item) => item.title).join('、') }}{{ selectedCount > 2 ? ` 等 ${selectedCount} 份` : '' }}</span></div><button @click="activePage = 'materials'">{{ selectedCount ? '调整资料' : '选择资料' }}<ChevronDown :size="13" /></button></div>
 
         <div class="conversation-layout">
           <div class="chat-column">
@@ -458,15 +458,15 @@ onMounted(initialize)
 
             <div class="composer-area">
               <div v-if="error" class="chat-error"><CircleAlert :size="14" /><span>{{ error }}</span><button @click="error = ''"><X :size="14" /></button></div>
-              <form class="composer" @submit.prevent="ask()"><textarea v-model="question" rows="2" :disabled="busy" :placeholder="mode === 'quiz' ? '回答小晗的问题，或告诉她想抽查哪个主题…' : '问一个你想复习的概念…'" @keydown.enter.exact.prevent="ask()"></textarea><div class="composer-bottom"><div class="composer-left"><button type="button" class="prompt-toggle" :disabled="busy" @click="systemPrompt = systemPrompt ? '' : '你叫小晗，是耐心的学习搭子。先检索选定资料，用简单中文结合代码讲清楚概念，再一次只问一个问题检查理解。'">{{ systemPrompt ? '自定义提示词已启用' : '学习提示词' }}<ChevronDown :size="12" /></button><span>回车发送</span></div><button class="send-button" type="submit" :disabled="busy || !question.trim() || !selectedCount" aria-label="发送问题"><Send :size="16" /></button></div></form>
+              <form class="composer" @submit.prevent="ask()"><textarea v-model="question" rows="2" :disabled="busy" :placeholder="mode === 'quiz' ? '回答小晗的问题，或告诉她想抽查哪个主题…' : '问一个你想复习的概念…'" @keydown.enter.exact.prevent="ask()"></textarea><div class="composer-bottom"><div class="composer-left"><button type="button" class="prompt-toggle" :disabled="busy" @click="systemPrompt = systemPrompt ? '' : '你叫小晗，是耐心的学习搭子。先检索选定资料，用简单中文结合代码讲清楚概念，再一次只问一个问题检查理解。'">{{ systemPrompt ? '自定义提示词已启用' : '学习提示词' }}<ChevronDown :size="12" /></button><span>回车发送</span></div><button class="send-button" type="submit" :disabled="busy || !question.trim() || !selectedCount" aria-label="发送问题"><ArrowUp :size="18" /></button></div></form>
               <textarea v-if="systemPrompt" v-model="systemPrompt" class="prompt-edit" aria-label="自定义学习提示词" placeholder="写下你希望小晗如何带你复习…"></textarea>
               <div class="local-note"><CircleCheck :size="12" />资料切片和向量在本地；复习问题及检索片段会发送给 DeepSeek</div>
             </div>
           </div>
 
-          <aside class="evidence-panel">
-            <div class="evidence-head"><div><span>本轮复习</span><strong>依据与过程</strong></div><span class="agent-badge"><Sparkles :size="12" />Agent</span></div>
-            <div class="evidence-scroll">
+          <aside id="review-evidence-panel" class="evidence-panel" :class="{ 'evidence-open': evidenceOpen }" aria-label="依据与过程">
+            <div class="evidence-head"><strong>依据与过程</strong><span class="agent-badge"><Sparkles :size="12" />Agent</span><button class="evidence-close icon-button" aria-label="收起依据" @click="evidenceOpen = false"><X :size="15" /></button></div>
+            <div id="review-evidence" class="evidence-scroll">
               <div class="process-heading"><span>Agent 工具过程</span><span v-if="latestSources.length" class="done-label"><span></span>完成</span></div>
               <div v-if="messages.length && latestSources.length" class="process-list"><div class="process-step"><div class="step-mark"><Check :size="11" /></div><div><strong>创建学习 Agent</strong><span>LangChain create_agent</span></div></div><div class="process-step"><div class="step-mark"><Check :size="11" /></div><div><strong>通过 MCP 检索资料</strong><span>search_study_materials</span></div></div><div class="process-step"><div class="step-mark"><Check :size="11" /></div><div><strong>结合资料生成讲解</strong><span>{{ latestSources.length }} 个引用片段</span></div></div></div>
               <div v-else class="process-empty"><Layers3 :size="16" /><span>开始复习后会显示小晗检索的资料依据。</span></div>

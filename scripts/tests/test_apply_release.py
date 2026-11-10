@@ -10,6 +10,8 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[2]
 REVISION = "a" * 40
 OLD_REVISION = "b" * 40
+BACKEND_IMAGE = "registry.example.com/xiaohan/xiaohan-review-backend@sha256:" + "c" * 64
+FRONTEND_IMAGE = "registry.example.com/xiaohan/xiaohan-review-frontend@sha256:" + "d" * 64
 MARKER = "# 此文件由小晗 CI/CD 自动生成。"
 
 FAKE_DOCKER = """#!/usr/bin/env python3
@@ -21,11 +23,13 @@ from pathlib import Path
 args = sys.argv[1:]
 with open(os.environ['FAKE_DOCKER_LOG'], 'a') as log:
     log.write(json.dumps(args) + '\\n')
-if args[0] == 'load' and os.environ.get('FAIL_STAGE') == 'load':
-    sys.exit(1)
+if args[0] == 'pull':
+    stage = os.environ.get('FAIL_STAGE', '')
+    if (stage == 'pull-backend' and 'xiaohan-review-backend@' in args[1]) or (stage == 'pull-frontend' and 'xiaohan-review-frontend@' in args[1]):
+        sys.exit(1)
 if args[0] == 'compose':
     override = Path(os.environ['FAKE_PROJECT']) / 'compose.override.yaml'
-    is_new = override.exists() and os.environ['FAKE_REVISION'] in override.read_text()
+    is_new = override.exists() and os.environ['FAKE_BACKEND_IMAGE'] in override.read_text()
     if is_new and 'up' in args and os.environ.get('FAIL_STAGE') == 'up':
         sys.exit(1)
     if is_new and 'exec' in args and os.environ.get('FAIL_STAGE') == 'proxy':
@@ -50,13 +54,14 @@ class ReleaseTests(unittest.TestCase):
         (self.project / "runtime/data/keep.txt").write_text("已有学习资料")
         (self.release / "compose.yaml").write_text("name: xiaohan-review\nservices:\n  backend: {}\n")
         (self.release / "REVISION").write_text(REVISION + "\n")
-        (self.release / "images.tar").touch()
+        (self.release / "BACKEND_IMAGE").write_text(BACKEND_IMAGE + "\n")
+        (self.release / "FRONTEND_IMAGE").write_text(FRONTEND_IMAGE + "\n")
         self.log = root / "docker.log"
         self.environment = {
             **os.environ,
             "PATH": str(self.binary) + os.pathsep + os.environ["PATH"],
             "FAKE_PROJECT": str(self.project),
-            "FAKE_REVISION": REVISION,
+            "FAKE_BACKEND_IMAGE": BACKEND_IMAGE,
             "FAKE_DOCKER_LOG": str(self.log),
             "FAIL_STAGE": "",
         }
@@ -87,10 +92,13 @@ class ReleaseTests(unittest.TestCase):
         result = self.apply()
         self.assertEqual(result.returncode, 0, result.stderr)
         override = (self.project / "compose.override.yaml").read_text()
-        self.assertIn(f"xiaohan-review-backend:{REVISION}", override)
-        self.assertIn(f"xiaohan-review-frontend:{REVISION}", override)
+        self.assertIn(BACKEND_IMAGE, override)
+        self.assertIn(FRONTEND_IMAGE, override)
         self.assertEqual((self.project / ".deploy/current-revision").read_text().strip(), REVISION)
         self.assertTrue(any("exec" in call and "frontend" in call for call in self.calls()))
+        calls = self.calls()
+        self.assertEqual(calls[:2], [["pull", BACKEND_IMAGE], ["pull", FRONTEND_IMAGE]])
+        self.assertFalse(any(call[0] in {"load", "login"} for call in calls))
 
     def test_failed_first_release_restores_existing_manual_deployment(self):
         result = self.apply("up")
@@ -117,11 +125,39 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse((self.project / "compose.override.yaml").exists())
         self.assertEqual(sum("up" in call for call in self.calls()), 2)
 
-    def test_image_import_failure_keeps_current_compose_and_containers(self):
-        result = self.apply("load")
+    def test_either_image_pull_failure_keeps_current_configuration_and_containers(self):
+        for stage in ("pull-backend", "pull-frontend"):
+            with self.subTest(stage=stage):
+                self.log.unlink(missing_ok=True)
+                result = self.apply(stage)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((self.project / "compose.yaml").read_text(), self.original_compose)
+                self.assertFalse((self.project / "compose.override.yaml").exists())
+                self.assertFalse(any("up" in call for call in self.calls()))
+
+    def test_pull_failure_preserves_previous_registry_release(self):
+        previous = f"{MARKER}\nservices:\n  backend:\n    image: registry.example.com/xiaohan/backend@sha256:{'e' * 64}\n"
+        (self.project / "compose.override.yaml").write_text(previous)
+        result = self.apply("pull-frontend")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual((self.project / "compose.yaml").read_text(), self.original_compose)
+        self.assertEqual((self.project / "compose.override.yaml").read_text(), previous)
         self.assertFalse(any("up" in call for call in self.calls()))
+
+    def test_mutable_tag_or_invalid_image_is_rejected_before_docker_calls(self):
+        for image in ("registry.example.com/xiaohan/backend:latest", "https://registry.example.com/backend@sha256:" + "c" * 64, BACKEND_IMAGE + "\n恶意附加内容"):
+            with self.subTest(image=image):
+                (self.release / "BACKEND_IMAGE").write_text(image)
+                result = self.apply()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("镜像地址格式不正确", result.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_missing_frontend_image_is_rejected_before_docker_calls(self):
+        (self.release / "FRONTEND_IMAGE").unlink()
+        result = self.apply()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("部署包缺少 FRONTEND_IMAGE", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_custom_override_is_preserved_and_requires_manual_merge(self):
         override = self.project / "compose.override.yaml"
@@ -139,7 +175,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.assertEqual((self.project / "compose.yaml").read_text(), self.original_compose)
 
-    def test_arm_server_is_rejected_before_loading_amd64_images(self):
+    def test_arm_server_is_rejected_before_pulling_amd64_images(self):
         self.environment["FAKE_MACHINE"] = "aarch64"
         result = self.apply()
         self.assertNotEqual(result.returncode, 0)

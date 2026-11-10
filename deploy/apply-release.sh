@@ -8,11 +8,17 @@ die() { printf '部署失败：%s\n' "$*" >&2; exit 1; }
 project_directory=$(realpath "$1")
 release_directory=$(realpath "$2")
 [[ -f "$project_directory/.env" && -f "$project_directory/compose.yaml" ]] || die '请先完成首次部署，项目目录需要已有 .env 和 compose.yaml'
-for name in compose.yaml images.tar REVISION; do
+for name in compose.yaml REVISION BACKEND_IMAGE FRONTEND_IMAGE; do
   [[ -f "$release_directory/$name" ]] || die "部署包缺少 $name"
 done
 revision=$(cat "$release_directory/REVISION")
 [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die '部署包中的提交版本格式不正确'
+backend_image=$(cat "$release_directory/BACKEND_IMAGE")
+frontend_image=$(cat "$release_directory/FRONTEND_IMAGE")
+# 只接受固定摘要的仓库镜像，避免标签变化后部署到未经本次构建验证的内容。
+image_pattern='^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$'
+[[ "$backend_image" =~ $image_pattern ]] || die '后端镜像地址格式不正确，需要完整仓库地址和 sha256 摘要'
+[[ "$frontend_image" =~ $image_pattern ]] || die '前端镜像地址格式不正确，需要完整仓库地址和 sha256 摘要'
 [[ $(uname -m) == x86_64 ]] || die '当前流水线构建的是 amd64 镜像，服务器需要 x86_64 架构'
 
 state_directory="$project_directory/.deploy"
@@ -33,10 +39,14 @@ compose() {
   docker compose "${arguments[@]}" "$@"
 }
 
-# 导入完成后再更新服务，传输或镜像校验失败不会中断当前容器。
-docker load --input "$release_directory/images.tar"
-docker image inspect "xiaohan-review-backend:$revision" > /dev/null
-docker image inspect "xiaohan-review-frontend:$revision" > /dev/null
+# 首次配置时在服务器执行 docker login；这里复用当前用户的仓库登录凭证。
+# 两个镜像全部拉取成功后才更新容器，已存在的镜像层会由 Docker 自动复用。
+printf '正在拉取后端镜像：%s\n' "$backend_image"
+docker pull "$backend_image"
+printf '正在拉取前端镜像：%s\n' "$frontend_image"
+docker pull "$frontend_image"
+docker image inspect "$backend_image" > /dev/null
+docker image inspect "$frontend_image" > /dev/null
 backup_directory=$(mktemp -d "$state_directory/rollback.XXXXXX")
 cp "$project_directory/compose.yaml" "$backup_directory/compose.yaml"
 if [[ -f "$override" ]]; then cp "$override" "$backup_directory/compose.override.yaml"; fi
@@ -65,8 +75,9 @@ trap 'rollback $?' ERR
 trap 'rollback 130' INT
 trap 'rollback 143' TERM
 cp "$release_directory/compose.yaml" "$project_directory/compose.yaml"
-printf '%s\nservices:\n  backend:\n    image: xiaohan-review-backend:%s\n  frontend:\n    image: xiaohan-review-frontend:%s\n' \
-  "$marker" "$revision" "$revision" > "$override"
+printf '%s\nservices:\n  backend:\n    image: %s\n  frontend:\n    image: %s\n' \
+  "$marker" "$backend_image" "$frontend_image" > "$override"
+printf '镜像已准备好，正在更新容器并等待健康检查……\n'
 compose config --quiet
 compose up -d --no-build --pull never --wait --wait-timeout 180
 

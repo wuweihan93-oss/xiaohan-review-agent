@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GitHub Runner 使用本次任务的临时 SSH 文件传输镜像，任务结束后删除私钥副本。
+# GitHub Runner 只传输部署配置；服务器从镜像仓库拉取镜像，任务结束后删除临时私钥副本。
 set -Eeuo pipefail
 umask 077
 
@@ -38,8 +38,9 @@ target="$SSH_USER@$SSH_HOST"
 remote_directory=$(ssh "${options[@]}" -p "$SSH_PORT" "$target" "mktemp -d /tmp/xiaohan-release.$REVISION.XXXXXX")
 [[ "$remote_directory" =~ ^/tmp/xiaohan-release\.[0-9a-f]{40}\.[a-zA-Z0-9]+$ ]] || die '服务器返回的临时目录不正确'
 
-printf '正在传输镜像部署包……\n'
+printf '正在传输部署配置包（不含 Docker 镜像），大小：%s 字节\n' "$(wc -c < "$archive")"
 scp "${options[@]}" -P "$SSH_PORT" "$archive" "$archive.sha256" "$target:$remote_directory/"
+printf '配置已传输，开始在服务器拉取镜像并部署……\n'
 printf -v remote_command 'cd %q && sha256sum -c %q && tar -xzf %q && test "$(cat REVISION)" = %q && bash ./apply-release.sh %q %q' \
   "$remote_directory" "$archive_name.sha256" "$archive_name" "$REVISION" "$DEPLOY_PATH" "$remote_directory"
 ssh "${options[@]}" -p "$SSH_PORT" "$target" "$remote_command"

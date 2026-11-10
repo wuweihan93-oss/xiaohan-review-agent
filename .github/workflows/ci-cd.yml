@@ -72,53 +72,96 @@ jobs:
           npm run build
 
   build:
-    name: 构建 Linux 镜像
+    name: 构建并推送 Linux 镜像
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - name: 检查仓库配置并生成镜像地址
+        id: images
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REGISTRY_HOST: ${{ vars.REGISTRY_HOST }}
+          REGISTRY_NAMESPACE: ${{ vars.REGISTRY_NAMESPACE }}
+          REVISION: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            backend_repository=xiaohan-review-backend
+            frontend_repository=xiaohan-review-frontend
+          else
+            [[ "$REGISTRY_HOST" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?$ ]] || {
+              echo '仓库配置错误：REGISTRY_HOST 需要填写仓库域名，不含 https:// 和命名空间。' >&2
+              exit 1
+            }
+            [[ "$REGISTRY_NAMESPACE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || {
+              echo '仓库配置错误：请配置 REGISTRY_NAMESPACE，使用小写字母、数字、点、下划线或连字符。' >&2
+              exit 1
+            }
+            backend_repository="$REGISTRY_HOST/$REGISTRY_NAMESPACE/xiaohan-review-backend"
+            frontend_repository="$REGISTRY_HOST/$REGISTRY_NAMESPACE/xiaohan-review-frontend"
+          fi
+          printf '%s\n' "backend_repository=$backend_repository" "frontend_repository=$frontend_repository" \
+            "backend=$backend_repository:$REVISION" "frontend=$frontend_repository:$REVISION" >> "$GITHUB_OUTPUT"
+      - name: 登录国内镜像仓库
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
       - name: 构建后端镜像
+        id: backend
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/backend.Dockerfile
           platforms: linux/amd64
-          load: true
+          push: ${{ github.event_name != 'pull_request' }}
           provenance: false
-          tags: xiaohan-review-backend:${{ github.sha }}
+          tags: ${{ steps.images.outputs.backend }}
           build-args: |
             DEBIAN_MIRROR=https://deb.debian.org
             PYPI_INDEX=https://pypi.org/simple
           cache-from: type=gha,scope=xiaohan-backend
           cache-to: type=gha,mode=max,scope=xiaohan-backend
       - name: 构建前端镜像
+        id: frontend
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/frontend.Dockerfile
           platforms: linux/amd64
-          load: true
+          push: ${{ github.event_name != 'pull_request' }}
           provenance: false
-          tags: xiaohan-review-frontend:${{ github.sha }}
+          tags: ${{ steps.images.outputs.frontend }}
           cache-from: type=gha,scope=xiaohan-frontend
           cache-to: type=gha,mode=max,scope=xiaohan-frontend
-      - name: 打包镜像和部署文件
+      - name: 打包部署配置（不含镜像）
         if: github.event_name != 'pull_request'
         env:
           REVISION: ${{ github.sha }}
+          BACKEND_REPOSITORY: ${{ steps.images.outputs.backend_repository }}
+          FRONTEND_REPOSITORY: ${{ steps.images.outputs.frontend_repository }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
         run: |
+          [[ "$BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo '打包失败：镜像构建没有返回有效的内容摘要。' >&2
+            exit 1
+          }
           mkdir -p "$RUNNER_TEMP/xiaohan-release"
-          docker save -o "$RUNNER_TEMP/xiaohan-release/images.tar" \
-            "xiaohan-review-backend:$REVISION" "xiaohan-review-frontend:$REVISION"
           cp compose.yaml "$RUNNER_TEMP/xiaohan-release/compose.yaml"
           cp deploy/apply-release.sh "$RUNNER_TEMP/xiaohan-release/apply-release.sh"
           printf '%s\n' "$REVISION" > "$RUNNER_TEMP/xiaohan-release/REVISION"
+          printf '%s@%s\n' "$BACKEND_REPOSITORY" "$BACKEND_DIGEST" > "$RUNNER_TEMP/xiaohan-release/BACKEND_IMAGE"
+          printf '%s@%s\n' "$FRONTEND_REPOSITORY" "$FRONTEND_DIGEST" > "$RUNNER_TEMP/xiaohan-release/FRONTEND_IMAGE"
           mkdir -p dist-release
-          tar -C "$RUNNER_TEMP/xiaohan-release" -cf - . | gzip -1 > dist-release/xiaohan-release.tar.gz
+          tar -C "$RUNNER_TEMP/xiaohan-release" -czf dist-release/xiaohan-release.tar.gz .
           cd dist-release
           sha256sum xiaohan-release.tar.gz > xiaohan-release.tar.gz.sha256
+          ls -lh xiaohan-release.tar.gz
       - name: 保存部署包
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
@@ -141,7 +184,7 @@ jobs:
         with:
           name: xiaohan-release-${{ github.sha }}
           path: dist-release
-      - name: 通过 SSH 传输镜像并部署
+      - name: 通过 SSH 下发配置并拉取镜像部署
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
