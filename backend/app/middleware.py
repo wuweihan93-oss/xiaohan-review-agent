@@ -35,7 +35,7 @@ def repair_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
         for call_id, call in calls.items():
             if call_id not in answered:
                 repaired.append(ToolMessage(
-                    content="上一次工具调用被中断，没有获得结果。请重新检索资料，不要把这条错误提示当作知识依据。",
+                    content="上一次工具调用被中断，没有获得结果。请按本轮可用工具重新检索，不要把这条错误提示当作知识依据。",
                     tool_call_id=call_id,
                     name=call["name"],
                     status="error",
@@ -56,12 +56,16 @@ class ToolRecoveryMiddleware(AgentMiddleware):
         try:
             return await handler(request)
         except Exception as exc:
-            logger.warning("学习资料工具执行失败（%s）：%s", request.tool_call["name"], exc)
+            name = request.tool_call["name"]
+            logger.warning("工具执行失败（%s，%s）", name, type(exc).__name__)
+            description = (
+                "联网搜索失败，本次没有取得网页结果。若有学习资料可以继续围绕资料讲解，但不能声称已联网验证最新信息。"
+                if name == "search_web" else "学习资料工具执行失败，本次没有取得资料检索结果。"
+            )
             # 让失败也产生匹配的 ToolMessage，避免整个图停在悬空的 tool_calls 上。
             return ToolMessage(
                 content=(
-                    "学习资料工具执行失败，本次没有取得检索结果。"
-                    "可以重试一次；若仍失败，请告诉用户资料服务暂时不可用，稍后再试。"
+                    description + "可以重试一次；若仍失败，请告诉用户对应检索服务暂时不可用，稍后再试。"
                     "不要编造检索内容。"
                 ),
                 tool_call_id=request.tool_call["id"],

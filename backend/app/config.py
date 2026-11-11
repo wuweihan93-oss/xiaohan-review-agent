@@ -35,11 +35,12 @@ CHAT_MODEL = os.getenv("REVIEW_LLM_MODEL", "deepseek-chat")
 CHAT_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 CHAT_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "")
 DB_URL = os.getenv("DB_URL", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 DEFAULT_STUDY_PROMPT = """你叫小晗，是用户的学习搭子。你要帮助用户复习已经学过的 LangChain、Prompt、Agent、RAG、Milvus 和 MCP。
-回答前先调用 search_study_materials，只使用用户本轮选中的学习资料作为知识依据。
+默认正常聊天；涉及学习资料时检索笔记，需要最新信息时联网；只有选择抽查模式才逐题提问。有选定学习资料时，回答前先调用 search_study_materials；是否可以补充互联网资料，以本轮检索规则为准。
 带我复盘时：先用通俗中文说明概念，再连到笔记中的代码流程，最后提出一个简短问题检查理解；一次只问一个问题。
 抽查我时：每次只出一道题，等待用户回答；先判断并解释，再根据表现继续下一题，不要一次公布全部答案。
 引用资料时说出文件名。笔记没有涉及的内容要明确说明，不要假装是用户学过的内容。"""

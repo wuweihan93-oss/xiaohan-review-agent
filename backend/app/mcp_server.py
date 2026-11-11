@@ -4,10 +4,19 @@ import os
 import httpx
 from fastmcp import FastMCP
 
-from app.config import API_BASE_URL
+from app.config import API_BASE_URL, TAVILY_API_KEY
+from app.web_search import search_web as run_web_search
 
 _selected_ids = json.loads(os.getenv("XIAOHAN_MATERIAL_IDS", "[]"))
 mcp = FastMCP("小晗学习资料")
+
+
+# 每次问答启动独立 MCP 子进程，未开启联网时不注册搜索工具。
+if os.getenv("XIAOHAN_WEB_SEARCH_ENABLED") == "1" and TAVILY_API_KEY:
+    @mcp.tool
+    async def search_web(query: str) -> str:
+        """搜索互联网公开资料。查询最新信息或补充笔记时使用，回答需引用网页标题和链接。"""
+        return json.dumps(await run_web_search(query), ensure_ascii=False)
 
 
 @mcp.tool

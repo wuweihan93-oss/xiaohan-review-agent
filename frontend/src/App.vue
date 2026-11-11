@@ -1,6 +1,8 @@
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { createId } from './id.js'
+import { sourceScoreLabel, webSourceUrl } from './sources.js'
+import { readEventStream } from './stream.js'
 import {
   ArrowDownToLine,
   ArrowUp,
@@ -10,9 +12,11 @@ import {
   ChevronDown,
   CircleAlert,
   CircleCheck,
+  ExternalLink,
   File,
   FileCode2,
   FileText,
+  Globe,
   History,
   Layers3,
   LoaderCircle,
@@ -20,6 +24,7 @@ import {
   MessageCircleMore,
   Plus,
   Sparkles,
+  Square,
   Trash2,
   Upload,
   X,
@@ -39,18 +44,26 @@ const activePage = ref('review')
 const materials = ref([])
 const savedConversationId = localStorage.getItem('xiaohan-conversation')
 const selectedIds = ref(new Set(storedJson('xiaohan-selected-materials', [])))
-const messages = ref(storedJson('xiaohan-messages', []))
+const messages = ref(storedJson('xiaohan-messages', []).map((message) => message.streaming ? {
+  ...message, streaming: false, failed: true,
+  content: `${message.content || ''}\n\n[上次生成已中断]`.trim(),
+} : message))
 const conversationId = ref(savedConversationId || createId())
 const conversations = ref([])
 const historyTotal = ref(0)
 const historyLoading = ref(false)
 const historyError = ref('')
+const deletingConversationId = ref('')
+const deleteCandidate = ref(null)
+const deleteDialog = ref(null)
+let previousFocus = null
 const activeConversationTitle = ref('')
 const switchingConversation = ref(false)
 const initializing = ref(true)
 const mode = ref(localStorage.getItem('xiaohan-mode') || 'coach')
 const question = ref('')
 const systemPrompt = ref(localStorage.getItem('xiaohan-prompt') || '')
+const webSearchEnabled = ref(storedJson('xiaohan-web-search', false) === true)
 const health = ref({ model_configured: false, counts: { tutorial: 0, upload: 0 } })
 const loading = ref(false)
 const importing = ref(false)
@@ -62,12 +75,19 @@ const mobileNav = ref(false)
 const evidenceOpen = ref(false)
 const chatBody = ref(null)
 const fileInput = ref(null)
+const followAnswer = ref(true)
+const stopping = ref(false)
+let streamController = null
+let saveTimer
 
-const busy = computed(() => loading.value || switchingConversation.value || initializing.value)
+const busy = computed(() => loading.value || switchingConversation.value || initializing.value || Boolean(deletingConversationId.value))
 const selectedMaterials = computed(() => materials.value.filter((item) => selectedIds.value.has(item.id)))
 const selectedCount = computed(() => selectedMaterials.value.length)
 const totalChunks = computed(() => materials.value.reduce((sum, item) => sum + item.chunk_count, 0))
 const latestSources = computed(() => [...messages.value].reverse().find((item) => item.role === 'assistant')?.sources || [])
+const latestTrace = computed(() => [...messages.value].reverse().find((item) => item.role === 'assistant')?.trace || [])
+const canAsk = computed(() => selectedCount.value > 0 || (webSearchEnabled.value && health.value.web_search_configured))
+const webSearchHint = computed(() => !health.value.web_search_configured ? '请在项目 .env 配置 TAVILY_API_KEY 后重启后端' : webSearchEnabled.value ? '已开启：需要时查询网上资料' : '开启后可查询网上资料')
 const currentTitle = computed(() => activeConversationTitle.value || conversations.value.find((item) => item.id === conversationId.value)?.title || '今天想复习什么？')
 
 async function api(path, options = {}) {
@@ -91,6 +111,7 @@ async function refresh() {
     const [materialData, status] = await Promise.all([api('/materials'), api('/health')])
     materials.value = materialData.materials
     health.value = status
+    if (!status.web_search_configured) webSearchEnabled.value = false
     const valid = new Set(materials.value.map((item) => item.id))
     selectedIds.value = new Set([...selectedIds.value].filter((id) => valid.has(id)))
   } catch (caught) {
@@ -104,9 +125,58 @@ function saveState() {
   localStorage.setItem('xiaohan-messages', JSON.stringify(messages.value.slice(-40)))
   localStorage.setItem('xiaohan-prompt', systemPrompt.value)
   localStorage.setItem('xiaohan-mode', mode.value)
+  localStorage.setItem('xiaohan-web-search', JSON.stringify(webSearchEnabled.value))
 }
 
-watch([selectedIds, messages, systemPrompt, conversationId, mode], saveState, { deep: true })
+watch([selectedIds, messages, systemPrompt, conversationId, mode, webSearchEnabled], () => {
+  if (saveTimer) return
+  saveTimer = setTimeout(() => {
+    saveTimer = undefined
+    saveState()
+  }, 250)
+}, { deep: true })
+
+watch(deleteCandidate, async (candidate) => {
+  if (candidate) {
+    previousFocus = document.activeElement
+    await nextTick()
+    deleteDialog.value?.querySelector('button')?.focus()
+  } else {
+    previousFocus?.focus()
+  }
+})
+
+function dialogKeydown(event) {
+  if (event.key === 'Escape' && !deletingConversationId.value) deleteCandidate.value = null
+  if (event.key !== 'Tab') return
+  const buttons = [...deleteDialog.value.querySelectorAll('button:not(:disabled)')]
+  const next = event.shiftKey ? buttons.at(-1) : buttons[0]
+  if (!buttons.length || document.activeElement === (event.shiftKey ? buttons[0] : buttons.at(-1))) {
+    event.preventDefault()
+    next?.focus()
+  }
+}
+
+async function removeConversation() {
+  const conversation = deleteCandidate.value
+  if (!conversation || busy.value) return
+  deletingConversationId.value = conversation.id
+  error.value = ''
+  try {
+    await api(`/conversations/${encodeURIComponent(conversation.id)}`, { method: 'DELETE' })
+    if (conversation.id === conversationId.value) resetConversation()
+    conversations.value = conversations.value.filter((item) => item.id !== conversation.id)
+    historyTotal.value = Math.max(0, historyTotal.value - 1)
+    deleteCandidate.value = null
+    notice.value = '已删除这段会话及其对话记忆。'
+    await loadHistory()
+    saveState()
+  } catch (caught) {
+    error.value = caught.message
+  } finally {
+    deletingConversationId.value = ''
+  }
+}
 
 async function loadHistory(append = false) {
   if (historyLoading.value) return
@@ -129,6 +199,7 @@ function applyConversation(conversation) {
   messages.value = conversation.messages
   mode.value = conversation.study_mode
   systemPrompt.value = conversation.prompt || ''
+  webSearchEnabled.value = Boolean(conversation.web_search_enabled && health.value.web_search_configured)
   const valid = new Set(materials.value.map((item) => item.id))
   selectedIds.value = new Set(conversation.material_ids.filter((id) => valid.has(id)))
   question.value = ''
@@ -165,7 +236,8 @@ async function initialize() {
         const result = await api(`/conversations/${encodeURIComponent(id)}`)
         applyConversation(result.conversation)
       } catch (caught) {
-        if (caught.status !== 404) error.value = `恢复复习记录失败：${caught.message}`
+        if (caught.status === 404) resetConversation()
+        else error.value = `恢复复习记录失败：${caught.message}`
       }
     }
     await scrollToEnd()
@@ -254,58 +326,99 @@ async function removeMaterial(material) {
 async function ask(text = question.value) {
   const value = text.trim()
   if (!value || busy.value) return
-  if (!selectedCount.value) {
-    error.value = '先到“学习资料”选择至少一份资料。'
+  if (!canAsk.value) {
+    error.value = '请选择至少一份学习资料，或开启联网搜索。'
     return
   }
   error.value = ''
   notice.value = ''
   question.value = ''
   const userMessage = { role: 'user', content: value, id: createId() }
+  const assistantId = createId()
   messages.value.push(userMessage)
+  messages.value.push({ role: 'assistant', content: '', id: assistantId, sources: [], trace: [], streaming: true })
+  if (!activeConversationTitle.value) activeConversationTitle.value = value.slice(0, 40)
   loading.value = true
+  stopping.value = false
+  followAnswer.value = true
+  streamController = new AbortController()
+  let terminal = false
+  const assistant = () => messages.value.find((item) => item.id === assistantId)
   await scrollToEnd()
   try {
-    const result = await api('/review', {
+    const response = await fetch(`${API}/review/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: streamController.signal,
       body: JSON.stringify({
         question: value,
         conversation_id: conversationId.value,
         material_ids: [...selectedIds.value],
         study_mode: mode.value,
         prompt: systemPrompt.value || null,
+        web_search_enabled: webSearchEnabled.value,
       }),
     })
-    if (result.user_message) {
-      const index = messages.value.findIndex((item) => item.id === userMessage.id)
-      if (index >= 0) messages.value[index] = result.user_message
-    }
-    messages.value.push(result.assistant_message || {
-      role: 'assistant',
-      content: result.answer,
-      sources: result.sources,
-      trace: result.trace,
-      id: createId(),
+    await readEventStream(response, (event, result) => {
+      const message = assistant()
+      if (result.user_message) {
+        const index = messages.value.findIndex((item) => item.id === userMessage.id)
+        if (index >= 0) messages.value[index] = result.user_message
+      }
+      if (event === 'token') message.content += result.text
+      else if (event === 'reset') message.content = ''
+      else if (event === 'state') Object.assign(message, result)
+      else if (event === 'done' || event === 'error') {
+        terminal = true
+        Object.assign(message, result.assistant_message || {
+          content: event === 'done' ? result.answer : result.content,
+          sources: result.sources || [], trace: result.trace || [], failed: event === 'error',
+        }, { streaming: false })
+        if (event === 'error') error.value = result.detail
+      }
+      if (followAnswer.value) scrollToEnd()
     })
+    if (!terminal) throw new Error('回答连接已中断，请稍后重试。')
   } catch (caught) {
-    error.value = caught.message
-    messages.value.push({ role: 'assistant', content: `这次复习没有完成：${caught.message}`, failed: true, id: createId() })
+    if (!terminal) {
+      const message = assistant()
+      const stopped = caught.name === 'AbortError'
+      const detail = stopped ? '已停止生成' : caught.message
+      if (!stopped) error.value = detail
+      message.content = stopped
+        ? (message.content ? `${message.content}\n\n[已停止生成]` : '已停止生成。')
+        : `${message.content ? message.content + '\n\n' : ''}这次复习没有完成：${detail}`
+      message.failed = true
+      message.streaming = false
+    }
   } finally {
-    await loadHistory()
+    streamController = null
     loading.value = false
-    await scrollToEnd()
+    stopping.value = false
+    saveState()
+    await loadHistory()
+    if (followAnswer.value) await scrollToEnd()
   }
+}
+
+function stopAnswer() {
+  if (!streamController || stopping.value) return
+  stopping.value = true
+  streamController.abort()
 }
 
 function startQuiz() {
   if (busy.value) return
   mode.value = 'quiz'
-  ask('从我选中的学习资料里开始抽查。先出一道题，不要先告诉我答案。')
+  ask(selectedCount.value ? '从我选中的学习资料里开始抽查。先出一道题，不要先告诉我答案。' : '先联网搜索 LangChain Agent 的官方资料，再出一道题，不要先告诉我答案。')
 }
 
 function newConversation() {
   if (busy.value) return
+  resetConversation()
+}
+
+function resetConversation() {
   messages.value = []
   conversationId.value = createId()
   activeConversationTitle.value = ''
@@ -325,16 +438,34 @@ async function scrollToEnd() {
   if (chatBody.value) chatBody.value.scrollTop = chatBody.value.scrollHeight
 }
 
+function trackScroll() {
+  const element = chatBody.value
+  if (element) followAnswer.value = element.scrollHeight - element.scrollTop - element.clientHeight < 100
+}
+
 function formatDate(value) {
   if (!value) return ''
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit' }).format(new Date(value))
 }
 
-function sourceIcon(source) {
+function sourceIcon(source = '') {
   return source.endsWith('.ipynb') || source.endsWith('.py') ? FileCode2 : FileText
 }
 
+function citationIcon(source) {
+  return source.type === 'web' ? Globe : sourceIcon(source.source)
+}
+
+function openCitation(source) {
+  if (source.type !== 'web') activePage.value = 'materials'
+}
+
 onMounted(initialize)
+onBeforeUnmount(() => {
+  streamController?.abort()
+  clearTimeout(saveTimer)
+  saveState()
+})
 </script>
 
 <template>
@@ -366,9 +497,12 @@ onMounted(initialize)
         <div v-if="historyError" class="history-empty history-error"><span>{{ historyError }}</span><button :disabled="historyLoading" @click="loadHistory()">重新加载</button></div>
         <div v-else-if="historyLoading && !conversations.length" class="history-empty"><LoaderCircle :size="13" class="spin" />正在读取历史记录…</div>
         <div v-else-if="!conversations.length" class="history-empty">{{ health.history_enabled ? '开始一轮复习后，会自动保存在这里。' : '配置 PostgreSQL 后即可保存历史复习。' }}</div>
-        <button v-for="conversation in conversations" :key="conversation.id" class="history-item" :class="{ current: conversation.id === conversationId }" :disabled="busy" :aria-current="conversation.id === conversationId ? 'true' : undefined" :title="conversation.title" @click="openConversation(conversation.id)">
-          <strong>{{ conversation.title }}</strong><span><time :datetime="conversation.updated_at">{{ formatDate(conversation.updated_at) }}</time><i>·</i>{{ conversation.study_mode === 'quiz' ? '抽查' : '复盘' }}<i>·</i>{{ conversation.message_count }} 条消息</span>
-        </button>
+        <div v-for="conversation in conversations" :key="conversation.id" class="history-row" :class="{ current: conversation.id === conversationId }">
+          <button class="history-item" :disabled="busy" :aria-current="conversation.id === conversationId ? 'true' : undefined" :title="conversation.title" @click="openConversation(conversation.id)">
+            <strong>{{ conversation.title }}</strong><span><time :datetime="conversation.updated_at">{{ formatDate(conversation.updated_at) }}</time><i>·</i>{{ conversation.study_mode === 'quiz' ? '抽查' : '复盘' }}<i>·</i>{{ conversation.message_count }} 条消息</span>
+          </button>
+          <button class="history-delete icon-button" :disabled="busy || historyLoading" :aria-label="`删除会话：${conversation.title}`" title="删除会话" @click="deleteCandidate = conversation; error = ''"><Trash2 :size="14" /></button>
+        </div>
         <button v-if="conversations.length < historyTotal" class="history-more" :disabled="historyLoading || busy" @click="loadHistory(true)">{{ historyLoading ? '正在读取…' : '加载更多' }}</button>
       </div>
 
@@ -432,47 +566,67 @@ onMounted(initialize)
 
         <div class="conversation-layout">
           <div class="chat-column">
-            <div ref="chatBody" class="chat-scroll">
+            <div ref="chatBody" class="chat-scroll" @scroll="trackScroll">
               <div v-if="initializing || switchingConversation" class="conversation-loading" role="status"><LoaderCircle :size="18" class="spin" />正在恢复复习记录…</div>
               <div v-else-if="!messages.length" class="start-state">
                 <div class="xiaohan-avatar"><Sparkles :size="22" /></div>
                 <div class="start-label">小晗在这里</div>
                 <h2>{{ mode === 'quiz' ? '准备好接受抽查了吗？' : '我们从你学过的开始。' }}</h2>
-                <p>{{ selectedCount ? `已选 ${selectedCount} 份资料，选一个主题开始吧。` : '先选几份学习资料，小晗会围绕资料陪你复习。' }}</p>
+                <p>{{ selectedCount ? `已选 ${selectedCount} 份资料，选一个主题开始吧。` : webSearchEnabled ? '联网搜索已开启，告诉小晗你想了解的主题。' : '先选几份学习资料，或开启联网搜索。' }}</p>
                 <div class="starter-prompts">
-                  <button :disabled="!selectedCount" @click="ask('用简单的话帮我梳理所选资料里的核心概念，并结合代码讲解。')"><BookOpen :size="15" /><span>帮我梳理核心概念</span></button>
-                  <button :disabled="!selectedCount" @click="ask('带我复习 RAG 的完整流程，从文档加载、切分到向量检索。')"><Layers3 :size="15" /><span>复盘 RAG 完整流程</span></button>
-                  <button :disabled="!selectedCount" @click="startQuiz"><CheckCheck :size="15" /><span>从资料里抽查我</span></button>
-                  <button :disabled="!selectedCount" @click="ask('用一个简单例子比较 LangChain Tool 和 MCP Tool。')"><Sparkles :size="15" /><span>比较 Tool 和 MCP</span></button>
+                  <button :disabled="!canAsk" @click="ask(selectedCount ? '用简单的话帮我梳理所选资料里的核心概念，并结合代码讲解。' : '联网查询 LangChain Agent 官方文档，帮我梳理核心概念。')"><BookOpen :size="15" /><span>帮我梳理核心概念</span></button>
+                  <button :disabled="!canAsk" @click="ask('带我复习 RAG 的完整流程，从文档加载、切分到向量检索。')"><Layers3 :size="15" /><span>复盘 RAG 完整流程</span></button>
+                  <button :disabled="!canAsk" @click="startQuiz"><CheckCheck :size="15" /><span>{{ selectedCount ? '从资料里抽查我' : '搜官方资料抽查我' }}</span></button>
+                  <button v-if="webSearchEnabled" :disabled="!canAsk" @click="ask('联网查找 LangChain 最新的官方 Agent 文档，讲讲 create_agent 的用法，并附上来源链接。')"><Globe :size="15" /><span>查最新官方文档</span></button>
+                  <button v-else :disabled="!canAsk" @click="ask('用一个简单例子比较 LangChain Tool 和 MCP Tool。')"><Sparkles :size="15" /><span>比较 Tool 和 MCP</span></button>
                 </div>
                 <button v-if="!selectedCount" class="choose-materials" @click="activePage = 'materials'"><BookOpen :size="14" />去选择学习资料</button>
               </div>
 
               <div v-for="message in messages" :key="message.id" class="message-line" :class="`line-${message.role}`">
                 <div v-if="message.role === 'assistant'" class="chat-avatar"><Sparkles :size="15" /></div>
-                <div class="bubble-column"><span class="speaker">{{ message.role === 'user' ? '我' : '小晗' }}</span><div class="bubble" :class="{ failed: message.failed }">{{ message.content }}</div><div v-if="message.role === 'assistant' && message.sources?.length" class="citation-list"><div class="citation-label">参考资料</div><button v-for="(source, index) in message.sources" :key="`${source.source}-${index}`" class="citation" @click="activePage = 'materials'"><component :is="sourceIcon(source.source)" :size="13" /><span>{{ source.title }}</span><small>{{ Math.round(source.score * 100) }}%</small></button></div></div>
+                <div class="bubble-column">
+                  <span class="speaker">{{ message.role === 'user' ? '我' : '小晗' }}</span>
+                  <div class="bubble" :class="{ failed: message.failed }">{{ message.content }}</div>
+                  <div v-if="message.streaming" class="typing" role="status"><LoaderCircle :size="13" class="spin" /><span>{{ message.content ? '正在生成…' : message.trace?.at(-1)?.label || '小晗正在准备回答…' }}</span></div>
+                  <div v-if="message.role === 'assistant' && message.sources?.length" class="citation-list">
+                    <div class="citation-label">参考来源</div>
+                    <component :is="webSourceUrl(source) ? 'a' : 'button'" v-for="(source, index) in message.sources" :key="`${source.source}-${index}`" class="citation" :href="webSourceUrl(source) || undefined" :target="webSourceUrl(source) ? '_blank' : undefined" rel="noopener noreferrer" @click="openCitation(source)">
+                      <component :is="citationIcon(source)" :size="13" />
+                      <span>{{ source.title || source.source }}</span>
+                      <small v-if="source.type === 'web'">网页</small><small v-else-if="sourceScoreLabel(source)">{{ sourceScoreLabel(source) }}</small>
+                      <ExternalLink v-if="webSourceUrl(source)" :size="11" />
+                    </component>
+                  </div>
+                </div>
               </div>
 
-              <div v-if="loading" class="message-line line-assistant"><div class="chat-avatar"><Sparkles :size="15" /></div><div class="typing"><LoaderCircle :size="14" class="spin" /><span>小晗正在翻看资料…</span></div></div>
             </div>
 
             <div class="composer-area">
               <div v-if="error" class="chat-error"><CircleAlert :size="14" /><span>{{ error }}</span><button @click="error = ''"><X :size="14" /></button></div>
-              <form class="composer" @submit.prevent="ask()"><textarea v-model="question" rows="2" :disabled="busy" :placeholder="mode === 'quiz' ? '回答小晗的问题，或告诉她想抽查哪个主题…' : '问一个你想复习的概念…'" @keydown.enter.exact.prevent="ask()"></textarea><div class="composer-bottom"><div class="composer-left"><button type="button" class="prompt-toggle" :disabled="busy" @click="systemPrompt = systemPrompt ? '' : '你叫小晗，是耐心的学习搭子。先检索选定资料，用简单中文结合代码讲清楚概念，再一次只问一个问题检查理解。'">{{ systemPrompt ? '自定义提示词已启用' : '学习提示词' }}<ChevronDown :size="12" /></button><span>回车发送</span></div><button class="send-button" type="submit" :disabled="busy || !question.trim() || !selectedCount" aria-label="发送问题"><ArrowUp :size="18" /></button></div></form>
+              <form class="composer" @submit.prevent="ask()">
+                <textarea v-model="question" rows="2" :disabled="busy" :placeholder="mode === 'quiz' ? '回答小晗的问题，或告诉她想抽查哪个主题…' : webSearchEnabled ? '问一个想了解的主题，也可以查最新资料…' : '问一个你想复习的概念…'" @keydown.enter.exact.prevent="ask()"></textarea>
+                <div class="composer-bottom"><div class="composer-left">
+                  <button type="button" class="web-search-toggle" :class="{ active: webSearchEnabled }" :aria-pressed="webSearchEnabled" :disabled="busy || !health.web_search_configured" :title="webSearchHint" @click="webSearchEnabled = !webSearchEnabled"><Globe :size="13" /><span>{{ webSearchEnabled ? '联网已开' : '联网搜索' }}</span></button>
+                  <button type="button" class="prompt-toggle" :disabled="busy" @click="systemPrompt = systemPrompt ? '' : '你叫小晗，是耐心的学习搭子。按照本轮检索规则查询来源，用简单中文结合代码讲清楚概念，再一次只问一个问题检查理解。'">{{ systemPrompt ? '自定义提示词已启用' : '学习提示词' }}<ChevronDown :size="12" /></button>
+                  <span class="enter-hint">回车发送</span>
+                </div><button v-if="loading" class="send-button" type="button" :disabled="stopping" aria-label="停止生成" title="停止生成" @click="stopAnswer"><Square :size="13" fill="currentColor" /></button><button v-else class="send-button" type="submit" :disabled="busy || !question.trim() || !canAsk" aria-label="发送问题"><ArrowUp :size="18" /></button></div>
+              </form>
               <textarea v-if="systemPrompt" v-model="systemPrompt" class="prompt-edit" aria-label="自定义学习提示词" placeholder="写下你希望小晗如何带你复习…"></textarea>
-              <div class="local-note"><CircleCheck :size="12" />资料切片和向量在本地；复习问题及检索片段会发送给 DeepSeek</div>
+              <div class="local-note"><CircleCheck :size="12" />{{ webSearchEnabled ? '联网查询会发送给 Tavily，检索摘要与问题交给 DeepSeek 整理' : '资料切片和向量在本地；复习问题及检索片段会发送给 DeepSeek' }}</div>
             </div>
           </div>
 
           <aside id="review-evidence-panel" class="evidence-panel" :class="{ 'evidence-open': evidenceOpen }" aria-label="依据与过程">
             <div class="evidence-head"><strong>依据与过程</strong><span class="agent-badge"><Sparkles :size="12" />Agent</span><button class="evidence-close icon-button" aria-label="收起依据" @click="evidenceOpen = false"><X :size="15" /></button></div>
             <div id="review-evidence" class="evidence-scroll">
-              <div class="process-heading"><span>Agent 工具过程</span><span v-if="latestSources.length" class="done-label"><span></span>完成</span></div>
-              <div v-if="messages.length && latestSources.length" class="process-list"><div class="process-step"><div class="step-mark"><Check :size="11" /></div><div><strong>创建学习 Agent</strong><span>LangChain create_agent</span></div></div><div class="process-step"><div class="step-mark"><Check :size="11" /></div><div><strong>通过 MCP 检索资料</strong><span>search_study_materials</span></div></div><div class="process-step"><div class="step-mark"><Check :size="11" /></div><div><strong>结合资料生成讲解</strong><span>{{ latestSources.length }} 个引用片段</span></div></div></div>
-              <div v-else class="process-empty"><Layers3 :size="16" /><span>开始复习后会显示小晗检索的资料依据。</span></div>
+              <div class="process-heading"><span>Agent 工具过程</span><span v-if="latestTrace.length" class="done-label"><span></span>本轮记录</span></div>
+              <div v-if="latestTrace.length" class="process-list"><div v-for="(step, index) in latestTrace" :key="index" class="process-step" :class="{ 'process-failed': step.status === 'error' }"><div class="step-mark"><CircleAlert v-if="step.status === 'error'" :size="11" /><Check v-else :size="11" /></div><div><strong>{{ step.label }}</strong><span>{{ step.detail }}</span></div></div></div>
+              <div v-else class="process-empty"><Layers3 :size="16" /><span>新的问答会在这里显示实际工具调用记录。</span></div>
 
-              <div class="evidence-title"><span>检索到的片段</span><span>{{ latestSources.length }}</span></div>
-              <div v-if="latestSources.length" class="evidence-list"><article v-for="(source, index) in latestSources" :key="`${source.source}-${index}`" class="evidence-card"><div class="evidence-card-title"><component :is="sourceIcon(source.source)" :size="13" /><strong>{{ source.title }}</strong><small>{{ Math.round(source.score * 100) }}%</small></div><p>{{ source.text }}</p><span class="evidence-path">{{ source.source }}</span></article></div>
+              <div class="evidence-title"><span>资料与网页来源</span><span>{{ latestSources.length }}</span></div>
+              <div v-if="latestSources.length" class="evidence-list"><article v-for="(source, index) in latestSources" :key="`${source.source}-${index}`" class="evidence-card"><div class="evidence-card-title"><component :is="citationIcon(source)" :size="13" /><strong>{{ source.title || source.source }}</strong><small v-if="source.type === 'web'">网页</small><small v-else-if="sourceScoreLabel(source)">{{ sourceScoreLabel(source) }}</small></div><p>{{ source.text }}</p><a v-if="webSourceUrl(source)" class="evidence-path evidence-link" :href="webSourceUrl(source)" target="_blank" rel="noopener noreferrer">{{ source.url }} ↗</a><span v-else class="evidence-path">{{ source.source }}</span></article></div>
               <div v-else class="no-evidence">还没有检索片段</div>
 
               <div class="selection-box-panel"><div><BookOpen :size="14" /><strong>资料范围</strong></div><span>{{ selectedCount }} 份资料</span><button @click="activePage = 'materials'">更改选择</button></div>
@@ -482,5 +636,13 @@ onMounted(initialize)
         </div>
       </section>
     </main>
+    <div v-if="deleteCandidate" class="dialog-backdrop" @click.self="!deletingConversationId && (deleteCandidate = null)" @keydown="dialogKeydown">
+      <section ref="deleteDialog" class="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title">
+        <h2 id="delete-dialog-title">删除这段会话？</h2>
+        <p>“{{ deleteCandidate.title }}”的消息和对话记忆将一并删除，无法恢复。上传的学习资料会保留。</p>
+        <p v-if="error" class="dialog-error" role="alert">{{ error }}</p>
+        <div class="dialog-actions"><button class="secondary-button" :disabled="Boolean(deletingConversationId)" autofocus @click="deleteCandidate = null">取消</button><button class="primary-button" :disabled="Boolean(deletingConversationId)" @click="removeConversation"><LoaderCircle v-if="deletingConversationId" :size="14" class="spin" />{{ deletingConversationId ? '正在删除…' : '确认删除' }}</button></div>
+      </section>
+    </div>
   </div>
 </template>

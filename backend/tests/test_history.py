@@ -31,6 +31,77 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
                 await connection.execute("DELETE FROM xiaohan_conversations WHERE id = %s", (conversation_id,))
         await self.lifespan.__aexit__(None, None, None)
 
+    async def test_delete_removes_messages_and_memory_without_resurrection(self):
+        from langchain.agents import create_agent
+        from langchain_core.messages import AIMessage, HumanMessage
+        from app import agent
+        from app.conversations import backfill_conversations
+        from test_streaming import search_study_materials
+        from test_tool_recovery import StrictToolModel, call
+
+        graph = create_agent(
+            model=StrictToolModel(responses=[
+                AIMessage(content="", tool_calls=[call("search_study_materials", "lookup")]),
+                AIMessage(content="已复习"),
+            ]), tools=[search_study_materials], checkpointer=agent._memory,
+        )
+        with patch("app.main.review", new=AsyncMock(return_value=self.answer("资料"))):
+            for index, conversation_id in enumerate(self.ids):
+                await self.client.post("/api/review", json=self.request(index))
+                await graph.ainvoke({"messages": [HumanMessage(content="检索资料")]}, {"configurable": {"thread_id": conversation_id}})
+        config = {"configurable": {"thread_id": self.ids[0]}}
+        self.assertIsNotNone(await agent._memory.aget_tuple(config))
+        response = await self.client.delete(f"/api/conversations/{self.ids[0]}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(await agent._memory.aget_tuple(config))
+        self.assertEqual(await backfill_conversations(agent._memory), 0)
+        async with await AsyncConnection.connect(DB_URL, autocommit=True) as connection:
+            for table in ("xiaohan_messages", "checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                column = "conversation_id" if table == "xiaohan_messages" else "thread_id"
+                cursor = await connection.execute(f"SELECT count(*) FROM {table} WHERE {column} = %s", (self.ids[0],))
+                self.assertEqual((await cursor.fetchone())[0], 0)
+        self.assertIsNotNone(await agent._memory.aget_tuple({"configurable": {"thread_id": self.ids[1]}}))
+        remaining = await self.client.get(f"/api/conversations/{self.ids[1]}")
+        self.assertEqual(len(remaining.json()["conversation"]["messages"]), 2)
+        await self.lifespan.__aexit__(None, None, None)
+        self.lifespan = main.app.router.lifespan_context(main.app)
+        await self.lifespan.__aenter__()
+        missing = await self.client.get(f"/api/conversations/{self.ids[0]}")
+        self.assertEqual(missing.status_code, 404)
+        repeated = await self.client.delete(f"/api/conversations/{self.ids[0]}")
+        self.assertEqual(repeated.status_code, 404)
+        await agent.delete_memory(self.ids[1])
+
+    async def test_memory_cleanup_failure_preserves_history_for_retry(self):
+        with patch("app.main.review", new=AsyncMock(return_value=self.answer("资料"))):
+            await self.client.post("/api/review", json=self.request())
+        with patch("app.main.delete_memory", new=AsyncMock(side_effect=RuntimeError("模拟记忆清理失败"))):
+            response = await self.client.delete(f"/api/conversations/{self.ids[0]}")
+        self.assertEqual(response.status_code, 503)
+        restored = await self.client.get(f"/api/conversations/{self.ids[0]}")
+        self.assertEqual(len(restored.json()["conversation"]["messages"]), 2)
+
+    async def test_stream_round_persists_one_answer_and_partial_failure(self):
+        async def success(**options):
+            yield {"event": "token", "data": {"text": "逐步"}}
+            yield {"event": "token", "data": {"text": "回答"}}
+            yield {"event": "result", "data": {"answer": "逐步回答", "sources": [], "trace": []}}
+        async def failed(**options):
+            yield {"event": "token", "data": {"text": "部分内容"}}
+            raise RuntimeError("模拟断流")
+        with patch("app.main.review_stream", success):
+            first = await self.client.post("/api/review/stream", json=self.request())
+        with patch("app.main.review_stream", failed):
+            second = await self.client.post("/api/review/stream", json=self.request(question="继续"))
+        self.assertIn("event: done", first.text)
+        self.assertIn("event: error", second.text)
+        saved = (await self.client.get(f"/api/conversations/{self.ids[0]}")).json()["conversation"]
+        self.assertEqual([message["role"] for message in saved["messages"]], ["user", "assistant", "user", "assistant"])
+        self.assertEqual(saved["messages"][1]["content"], "逐步回答")
+        self.assertFalse(saved["messages"][1]["failed"])
+        self.assertIn("部分内容", saved["messages"][3]["content"])
+        self.assertTrue(saved["messages"][3]["failed"])
+
     def request(self, index=0, **changes):
         return {
             "conversation_id": self.ids[index], "question": "测试：复习文档切分",
@@ -91,6 +162,27 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 404)
         invalid_page = await self.client.get("/api/conversations?limit=0")
         self.assertEqual(invalid_page.status_code, 422)
+
+    async def test_web_only_conversation_restores_switch_and_citable_urls(self):
+        source = {"type": "web", "title": "官方文档", "url": "https://docs.langchain.com/", "source": "https://docs.langchain.com/", "text": "联网摘要"}
+        answer = {"answer": "网上补充", "sources": [source], "trace": [{"label": "联网搜索返回结果", "detail": "search_web", "status": "success"}]}
+        with patch("app.main.TAVILY_API_KEY", "测试占位"), patch("app.main.review", new=AsyncMock(return_value=answer)):
+            response = await self.client.post("/api/review", json=self.request(material_ids=[], web_search_enabled=True))
+        self.assertEqual(response.status_code, 200)
+        saved = (await self.client.get(f"/api/conversations/{self.ids[0]}")).json()["conversation"]
+        self.assertTrue(saved["web_search_enabled"])
+        self.assertEqual(saved["material_ids"], [])
+        self.assertEqual(saved["messages"][1]["sources"], [source])
+        # 新连接仍能读取联网开关；关闭后的下一轮也要更新会话设置。
+        await self.lifespan.__aexit__(None, None, None)
+        self.lifespan = main.app.router.lifespan_context(main.app)
+        await self.lifespan.__aenter__()
+        restored = (await self.client.get(f"/api/conversations/{self.ids[0]}")).json()["conversation"]
+        self.assertTrue(restored["web_search_enabled"])
+        with patch("app.main.review", new=AsyncMock(return_value=self.answer("学习资料"))):
+            await self.client.post("/api/review", json=self.request(web_search_enabled=False))
+        updated = (await self.client.get(f"/api/conversations/{self.ids[0]}")).json()["conversation"]
+        self.assertFalse(updated["web_search_enabled"])
 
 
 if __name__ == "__main__":

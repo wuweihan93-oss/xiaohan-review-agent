@@ -1,7 +1,7 @@
 """保存供页面查看的复习记录；LangGraph checkpoint 继续负责模型上下文。"""
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -40,9 +40,15 @@ async def history_context() -> AsyncIterator[None]:
                             material_ids JSONB NOT NULL DEFAULT '[]',
                             study_mode TEXT NOT NULL DEFAULT 'coach',
                             prompt TEXT,
+                            web_search_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                         )
+                    """)
+                    # 已部署的旧表按需补列，旧会话默认不启用联网。
+                    await connection.execute("""
+                        ALTER TABLE xiaohan_conversations
+                        ADD COLUMN IF NOT EXISTS web_search_enabled BOOLEAN NOT NULL DEFAULT FALSE
                     """)
                     await connection.execute("""
                         CREATE TABLE IF NOT EXISTS xiaohan_messages (
@@ -106,18 +112,35 @@ async def get_conversation(conversation_id: str) -> dict[str, Any] | None:
         return conversation
 
 
+async def delete_conversation(conversation_id: str, delete_memory: Callable[[str], Awaitable[None]]) -> bool:
+    """只删除本项目的会话；先清理记忆，防止启动时从 checkpoint 恢复已删记录。"""
+    async with _database().connection() as connection:
+        async with connection.transaction():
+            cursor = await connection.execute(
+                "SELECT id FROM xiaohan_conversations WHERE id = %s FOR UPDATE", (conversation_id,)
+            )
+            if await cursor.fetchone() is None:
+                return False
+            await delete_memory(conversation_id)
+            # 外键级联删除该会话的所有消息，不影响上传资料或其他会话。
+            await connection.execute("DELETE FROM xiaohan_conversations WHERE id = %s", (conversation_id,))
+    return True
+
+
 async def begin_turn(
-    conversation_id: str, question: str, material_ids: list[str], study_mode: str, prompt: str | None
+    conversation_id: str, question: str, material_ids: list[str], study_mode: str, prompt: str | None,
+    *, web_search_enabled: bool = False,
 ) -> dict[str, Any]:
     message = {"id": str(uuid.uuid4()), "role": "user", "content": question}
     async with _database().connection() as connection:
         async with connection.transaction():
             await connection.execute("""
-                INSERT INTO xiaohan_conversations (id, title, material_ids, study_mode, prompt)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO xiaohan_conversations (id, title, material_ids, study_mode, prompt, web_search_enabled)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET material_ids = EXCLUDED.material_ids,
-                    study_mode = EXCLUDED.study_mode, prompt = EXCLUDED.prompt, updated_at = now()
-            """, (conversation_id, " ".join(question.split())[:40], Jsonb(material_ids), study_mode, prompt))
+                    study_mode = EXCLUDED.study_mode, prompt = EXCLUDED.prompt,
+                    web_search_enabled = EXCLUDED.web_search_enabled, updated_at = now()
+            """, (conversation_id, " ".join(question.split())[:40], Jsonb(material_ids), study_mode, prompt, web_search_enabled))
             await connection.execute("""
                 INSERT INTO xiaohan_messages (id, conversation_id, role, content)
                 VALUES (%s, %s, 'user', %s)

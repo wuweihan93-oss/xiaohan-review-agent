@@ -1,6 +1,6 @@
 # 小晗带你复习
 
-一个用来真正复习学习资料的小型 Agent。资料先被解析、递归切分、向量化并写入 Milvus Lite；复习时，LangChain Agent 通过 MCP 检索你选中的资料，再根据提示词讲解或逐题抽查。配置 `DB_URL` 后，对话记忆通过 LangGraph PostgreSQL Checkpointer 持久化；留空时回退到重启即清空的 `InMemorySaver`。
+一个用来真正复习学习资料的小型 Agent。资料先被解析、递归切分、向量化并写入 Milvus Lite；复习时，LangChain Agent 通过 MCP 检索你选中的资料，再根据提示词讲解或逐题抽查。开启联网搜索后，还可以通过 Tavily 查询公开网页，并显示可打开的来源链接。配置 `DB_URL` 后，对话记忆通过 LangGraph PostgreSQL Checkpointer 持久化；留空时回退到重启即清空的 `InMemorySaver`。
 
 ## 运行
 
@@ -36,6 +36,40 @@ npm run dev
 3. 在“复盘学习”勾选资料，选择“带我复盘”或“抽查我”，和小晗围绕资料对话。
 4. Agent 会通过 MCP 搜索工具查找选中资料。回答显示引用文件、命中的片段和 Agent 工具调用过程。
 5. 左侧“历史复习”按最近复习时间排列。点击记录可恢复问答、引用、资料范围、提示词及复盘/抽查模式，并继续同一个会话；点击“新复习”会创建新会话，旧记录保留。
+6. 鼠标移到历史会话上，点击垃圾桶图标并确认即可删除；手机端直接显示删除按钮。删除会话会同时清理问答与 Agent 记忆，保留学习资料。
+7. 回答会逐步显示，检索期间可以查看工具过程。点击输入框右下角的停止按钮可中断生成；已有文字会作为中断记录保留。
+6. 输入框下方的“联网搜索”默认关闭。开启后可补充网上资料，也可以不选文件直接查询主题；“依据与过程”显示本轮实际使用的工具和网页来源。
+
+## 联网搜索
+
+在本机和 Ubuntu 项目目录的 `.env` 中配置独立的 Tavily Key：
+
+```env
+TAVILY_API_KEY=你的Tavily密钥
+```
+
+本机重启后端后生效。Ubuntu 修改 `.env` 后，在项目目录执行以下命令，让后端容器重新读取环境变量：
+
+```bash
+docker compose up -d --no-deps --no-build --force-recreate backend
+```
+
+已有本机配置可以继续使用；模型 Key 和百炼 Embedding Key 不能代替搜索 Key。没有配置时，“联网搜索”不可用，学习资料复习仍可正常使用。Key 通过运行时环境传给 MCP 子进程，不会发到前端或写进镜像。
+
+关闭开关时，本轮不注册或提供 `search_web` 工具，也不把历史网页引用作为本轮新检索结果。开启后，优先检索选定资料；需要最新信息、版本变化或用户明确要求上网时，Agent 应调用搜索工具，再区分笔记与网上补充。
+
+搜索一次最多取 5 条网页摘要，不抓取网页全文，不自动将网页写入 Milvus。网页引用展示为链接，资料引用仍跳转资料库；网页不显示向量相似度。搜索超时、认证错误和额度不足会产生中文错误，工具失败仍保留配对的 `ToolMessage`，允许 Agent 围绕已有资料继续讲解，并说明本轮未能核实网上信息。
+
+已有 PostgreSQL 会在启动时按需为会话表补充 `web_search_enabled` 列，旧会话默认关闭联网。网页来源与工具过程沿用现有 JSONB 字段保存，恢复历史时也会恢复该会话的联网开关。
+
+开发时可以沿着下面的调用链复盘：
+
+```text
+Vue 联网开关 → POST /api/review/stream → agent.review_stream
+    → MultiServerMCPClient → search_web MCP 工具
+    → web_search.py 调用 Tavily → ToolMessage 返回网页摘要
+    → 模型整理回答 → PostgreSQL 保存引用 → Vue 展示网页链接
+```
 
 ## 对话记录与记忆
 
@@ -45,6 +79,14 @@ npm run dev
 
 这是供本地单人使用的学习项目，历史列表展示本项目保存的全部会话。
 
+### 流式回答与删除会话
+
+页面通过 `fetch` 发起 `POST /api/review/stream`，后端使用 LangGraph `astream` 的 `messages` 模式取得模型片段，使用 `values` 模式整理本轮引用和工具过程，再通过 SSE 发送给浏览器。`token` 事件追加文字，`state` 更新引用与工具过程，`reset` 清除检索前的过渡语，`done` 返回最终保存的回答；发生错误则发送 `error`。原来的 `POST /api/review` 仍返回完整 JSON，便于调试和对照学习。
+
+同一轮只保存一条用户消息和一条回答，不按 token 写数据库。主动停止或浏览器断开连接时，后端会取消模型生成并保存已有文字；异常结束会保留错误说明。页面跟随回答滚动，上滑查看旧消息时暂停自动滚动。部署用 Nginx 已关闭代理缓冲；如果额外增加一层反向代理，也需要关闭该层的 SSE 缓冲。
+
+`DELETE /api/conversations/{conversation_id}` 在同一个会话锁内先调用 Checkpointer 的 `adelete_thread`，再删除会话表记录，由外键级联删除消息。这样旧 checkpoint 不会在下次启动时重新补入历史列表。生成过程中删除会返回中文忙碌提示，停止生成后即可操作。
+
 在 `backend` 目录运行 `XIAOHAN_POSTGRES_TESTS=1 uv run python -m unittest discover -s tests -v`，可验证历史记录跨连接保存、会话分页与隔离、失败记录保留以及本轮引用筛选。测试只清理自己创建的临时会话。
 
 资料工具出错时，`ToolRecoveryMiddleware` 会返回与 `tool_call_id` 对应的错误消息。若服务中断留下了不完整的旧工具记录，下次调用模型前会补齐中断标记，保留问答和已有检索结果，避免模型因缺失工具返回而拒绝整段对话。
@@ -52,10 +94,13 @@ npm run dev
 ## 跟着代码复盘
 
 - `backend/app/materials.py`：文件解析、`RecursiveCharacterTextSplitter`、百炼 Qwen3-VL-Embedding（未配置时本地回退）和 Milvus 入库/检索。
-- `backend/app/agent.py`：LangChain `create_agent`、MCP Adapter、系统 Prompt 和 PostgreSQL 持久化 Checkpointer。
+- `backend/app/agent.py`：LangChain `create_agent`、MCP Adapter、系统 Prompt、`astream` 和 PostgreSQL 持久化 Checkpointer。
 - `backend/app/conversations.py`：PostgreSQL 会话/消息表、历史分页查询和旧 checkpoint 记录恢复。
 - `backend/app/middleware.py`：LangChain AgentMiddleware、工具错误处理与中断后的消息修复。
 - `backend/app/mcp_server.py`：FastMCP 工具如何把资料检索能力提供给 Agent。
+- `backend/app/web_search.py`：Tavily 搜索、网页引用格式、请求超时和中文错误处理。
+- `frontend/src/sources.js`：网页引用链接校验与资料相似度显示。
+- `frontend/src/stream.js`：SSE 网络拆包解析与中文字符解码。
 - `backend/app/main.py`：FastAPI 上传/导入/删除资料和聊天接口。
 - `frontend/src/App.vue`：资料导入和复习对话交互。
 
