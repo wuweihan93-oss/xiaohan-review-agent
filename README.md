@@ -39,6 +39,7 @@ npm run dev
 6. 鼠标移到历史会话上，点击垃圾桶图标并确认即可删除；手机端直接显示删除按钮。删除会话会同时清理问答与 Agent 记忆，保留学习资料。
 7. 回答会逐步显示，检索期间可以查看工具过程。点击输入框右下角的停止按钮可中断生成；已有文字会作为中断记录保留。
 8. 输入框下方的“联网搜索”默认关闭。开启后，所选资料无法回答当前问题时会查询网页，也可以不选文件直接查询主题；“依据与过程”显示本轮实际使用的工具和网页来源。即使在抽查模式，用户换话题后也会优先回答新问题。
+9. AI 回答按 Markdown 显示，支持标题、加粗、列表、引用、表格和代码高亮，流式生成时也会实时排版。代码块和宽表格在手机上可横向滑动。每条回答下方的“复制”会复制完整 Markdown 原文，保留代码缩进；成功后显示“已复制”。普通 HTTP 部署使用兼容复制方式，浏览器禁止复制时会显示手动复制提示。
 
 ## 联网搜索
 
@@ -107,6 +108,7 @@ Vue 联网开关 → POST /api/review/stream → agent.review_stream
 - `backend/app/web_search.py`：Tavily 搜索、网页引用格式、请求超时和中文错误处理。
 - `frontend/src/sources.js`：网页引用链接校验与资料相似度显示。
 - `frontend/src/stream.js`：SSE 网络拆包解析与中文字符解码。
+- `frontend/src/AssistantAnswer.vue`、`markdown.js` 和 `clipboard.js`：AI 回答的 Markdown 排版、代码高亮与剪贴板复制。Markdown 禁用原始 HTML，链接只允许安全的 HTTP / HTTPS 地址。
 - `backend/app/main.py`：FastAPI 上传/导入/删除资料和聊天接口。
 - `frontend/src/App.vue`：资料导入和复习对话交互。
 

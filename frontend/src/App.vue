@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { createId } from './id.js'
 import { sourceScoreLabel, webSourceUrl } from './sources.js'
 import { readEventStream } from './stream.js'
+import AssistantAnswer from './AssistantAnswer.vue'
 import {
   ArrowDownToLine,
   ArrowUp,
@@ -633,17 +634,19 @@ onBeforeUnmount(() => {
                 <div v-if="message.role === 'assistant'" class="chat-avatar"><Sparkles :size="15" /></div>
                 <div class="bubble-column">
                   <span class="speaker">{{ message.role === 'user' ? '我' : '小晗' }}</span>
-                  <div class="bubble" :class="{ failed: message.failed }">{{ message.content }}</div>
-                  <div v-if="message.streaming" class="typing" role="status"><LoaderCircle :size="13" class="spin" /><span>{{ message.content ? '正在生成…' : message.trace?.at(-1)?.label || '小晗正在准备回答…' }}</span></div>
-                  <div v-if="message.role === 'assistant' && message.sources?.length" class="citation-list">
-                    <div class="citation-label">参考来源</div>
-                    <component :is="webSourceUrl(source) ? 'a' : 'button'" v-for="(source, index) in message.sources" :key="`${source.source}-${index}`" class="citation" :href="webSourceUrl(source) || undefined" :target="webSourceUrl(source) ? '_blank' : undefined" rel="noopener noreferrer" @click="openCitation(source)">
-                      <component :is="citationIcon(source)" :size="13" />
-                      <span>{{ source.title || source.source }}</span>
-                      <small v-if="source.type === 'web'">网页</small><small v-else-if="sourceScoreLabel(source)">{{ sourceScoreLabel(source) }}</small>
-                      <ExternalLink v-if="webSourceUrl(source)" :size="11" />
-                    </component>
-                  </div>
+                  <div v-if="message.role === 'user'" class="bubble">{{ message.content }}</div>
+                  <AssistantAnswer v-else :content="message.content" :failed="message.failed" :streaming="message.streaming">
+                    <div v-if="message.streaming" class="typing" role="status"><LoaderCircle :size="13" class="spin" /><span>{{ message.content ? '正在生成…' : message.trace?.at(-1)?.label || '小晗正在准备回答…' }}</span></div>
+                    <div v-if="message.sources?.length" class="citation-list">
+                      <div class="citation-label">参考来源</div>
+                      <component :is="webSourceUrl(source) ? 'a' : 'button'" v-for="(source, index) in message.sources" :key="`${source.source}-${index}`" class="citation" :href="webSourceUrl(source) || undefined" :target="webSourceUrl(source) ? '_blank' : undefined" rel="noopener noreferrer" @click="openCitation(source)">
+                        <component :is="citationIcon(source)" :size="13" />
+                        <span>{{ source.title || source.source }}</span>
+                        <small v-if="source.type === 'web'">网页</small><small v-else-if="sourceScoreLabel(source)">{{ sourceScoreLabel(source) }}</small>
+                        <ExternalLink v-if="webSourceUrl(source)" :size="11" />
+                      </component>
+                    </div>
+                  </AssistantAnswer>
                 </div>
               </div>
 
