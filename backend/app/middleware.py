@@ -4,10 +4,41 @@ import logging
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, BaseMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, ToolMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 logger = logging.getLogger(__name__)
+
+
+class RetrievalRoutingMiddleware(AgentMiddleware):
+    """每轮先检索选中资料；无资料或资料检索为空、失败时强制使用可用的网页工具。"""
+
+    def __init__(self, *, has_materials: bool, web_search_enabled: bool):
+        self.has_materials = has_materials
+        self.web_search_enabled = web_search_enabled
+
+    async def awrap_model_call(self, request, handler):
+        messages = request.messages
+        start = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)), -1)
+        current = messages[start + 1:]
+        results = [message for message in current if isinstance(message, ToolMessage)]
+        local_results = [message for message in results if message.name == "search_study_materials"]
+        searched_web = any(message.name == "search_web" for message in results)
+        target = None
+        if self.has_materials and not local_results:
+            target = "search_study_materials"
+        elif self.web_search_enabled and not searched_web:
+            # 使用统一的解析器识别有效资料片段；错误和空返回不作为已找到答案。
+            from app.agent import _tool_payload
+            if not self.has_materials or not any(
+                source["text"].strip() for message in local_results for source in _tool_payload(message)
+            ):
+                target = "search_web"
+        # 非空片段是否相关由模型判断；系统提示词要求资料不足时继续调用 search_web。
+        names = {tool.get("name") if isinstance(tool, dict) else tool.name for tool in request.tools}
+        if target in names:
+            request = request.override(tool_choice={"type": "function", "function": {"name": target}})
+        return await handler(request)
 
 
 def repair_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:

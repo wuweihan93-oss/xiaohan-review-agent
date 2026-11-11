@@ -1,18 +1,23 @@
 """重现工具失败后的残缺历史，并验证下一轮模型请求能正常恢复。"""
 
 import asyncio
+import json
 import unittest
+import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import StructuredTool
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langchain_core.messages import RemoveMessage
 
+from app import agent
 from app.middleware import ToolRecoveryMiddleware, repair_tool_messages
 
 
@@ -40,6 +45,103 @@ class StrictToolModel(FakeMessagesListChatModel):
         # 模拟真实模型接口对工具消息顺序的校验，不使用外部模型或密钥。
         validate_history(messages)
         return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+class RoutingToolModel(StrictToolModel):
+    """模拟模型服务遵循 tool_choice，同时检查工具消息顺序。"""
+
+    def bind_tools(self, tools, **kwargs):
+        return self.bind(**kwargs)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        validate_history(messages)
+        forced = kwargs.get("tool_choice")
+        if isinstance(forced, dict):
+            question = next(message.content for message in reversed(messages) if isinstance(message, HumanMessage))
+            message = AIMessage(content="", tool_calls=[{
+                "name": forced["function"]["name"], "args": {"query": question}, "id": uuid.uuid4().hex,
+            }])
+            return ChatResult(generations=[ChatGeneration(message=message)])
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+class RetrievalRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def run_review(self, *, local=None, local_error=False, web_error=False, has_materials=True,
+                         enabled=True, responses=None, stream=False, memory=None, question="貂蝉怎么玩"):
+        called = []
+        async def local_search(query: str) -> str:
+            called.append("search_study_materials")
+            if local_error:
+                raise RuntimeError("模拟资料服务失败")
+            return json.dumps(local or [], ensure_ascii=False)
+        async def web_search(query: str) -> str:
+            called.append("search_web")
+            if web_error:
+                raise RuntimeError("模拟联网服务失败")
+            return '[{"type":"web","title":"玩法攻略","url":"https://example.com/guide","text":"利用二技能位移，控制技能冷却。"}]'
+        tools = [
+            StructuredTool.from_function(coroutine=local_search, name="search_study_materials", description="检索本轮学习资料"),
+            StructuredTool.from_function(coroutine=web_search, name="search_web", description="查询互联网公开资料"),
+        ]
+        model = RoutingToolModel(responses=responses or [AIMessage(content="按本轮检索来源回答当前问题。")])
+        client = Mock(get_tools=AsyncMock(return_value=tools))
+        with patch.object(agent, "_memory", memory or InMemorySaver()), patch.object(agent, "TAVILY_API_KEY", "测试占位"), patch.object(agent, "_chat_model", return_value=model), patch.object(agent, "_mcp_client", return_value=client):
+            options = dict(question=question, conversation_id="routing-test", material_ids=["笔记"] if has_materials else [], study_mode="quiz", web_search_enabled=enabled, prompt="你只能回答 LangChain，用户问别的也要继续抽查。")
+            if stream:
+                events = [item async for item in agent.review_stream(**options)]
+                result = events[-1]["data"]
+            else:
+                result = await agent.review(**options)
+        return result, called
+
+    async def test_empty_material_result_forces_web_search(self):
+        result, called = await self.run_review()
+        self.assertEqual(called, ["search_study_materials", "search_web"])
+        self.assertEqual(result["sources"][0]["type"], "web")
+
+    async def test_blank_material_text_is_not_an_answer(self):
+        _, called = await self.run_review(local=[{"text": "  ", "source": "空白.md"}])
+        self.assertEqual(called, ["search_study_materials", "search_web"])
+
+    async def test_material_failure_also_falls_back_to_web_in_stream(self):
+        result, called = await self.run_review(local_error=True, stream=True)
+        self.assertEqual(called, ["search_study_materials", "search_web"])
+        self.assertTrue(any(item.get("status") == "error" for item in result["trace"]))
+        self.assertEqual(result["sources"][0]["type"], "web")
+
+    async def test_no_materials_goes_directly_to_web(self):
+        _, called = await self.run_review(has_materials=False)
+        self.assertEqual(called, ["search_web"])
+
+    async def test_sufficient_materials_do_not_force_web(self):
+        _, called = await self.run_review(local=[{"source": "笔记.md", "text": "create_agent 创建 Agent。"}], question="create_agent 的用途")
+        self.assertEqual(called, ["search_study_materials"])
+
+    async def test_nonempty_but_unrelated_results_can_still_use_web(self):
+        result, called = await self.run_review(
+            local=[{"source": "笔记.md", "text": "LangChain create_agent 的参数是 model 和 tools。", "score": .95}],
+            responses=[AIMessage(content="", tool_calls=[call("search_web", "off-topic")]), AIMessage(content="【网上补充】貂蝉需要注意二技能位移。")],
+        )
+        self.assertEqual(called, ["search_study_materials", "search_web"])
+        self.assertIn("貂蝉", result["answer"])
+
+    async def test_disabled_network_never_forces_web(self):
+        result, called = await self.run_review(enabled=False)
+        self.assertEqual(called, ["search_study_materials"])
+        self.assertFalse(any(item.get("type") == "web" for item in result["sources"]))
+
+    async def test_failed_web_search_ends_without_retry_loop_or_fake_sources(self):
+        result, called = await self.run_review(web_error=True)
+        self.assertEqual(called, ["search_study_materials", "search_web"])
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(result["trace"][-1]["label"], "联网搜索失败")
+
+    async def test_old_refusal_and_previous_tool_results_do_not_block_new_search(self):
+        memory = InMemorySaver()
+        old = create_agent(model=StrictToolModel(responses=[AIMessage(content="我只有 LangChain 笔记，没法回答游戏问题，继续抽查。")]), checkpointer=memory)
+        await old.ainvoke({"messages": [HumanMessage(content="马超怎么玩")]}, {"configurable": {"thread_id": "routing-test"}})
+        _, called = await self.run_review(memory=memory)
+        self.assertEqual(called, ["search_study_materials", "search_web"])
 
 
 @tool

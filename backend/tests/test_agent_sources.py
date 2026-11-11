@@ -66,6 +66,14 @@ class AgentSourcesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["trace"][-1]["status"], "error")
         self.assertEqual(result["trace"][-1]["label"], "联网搜索失败")
 
+    async def test_enabled_network_rule_handles_unrelated_material_and_topic_switch(self):
+        _, options, _ = await self.run_review(enabled=True)
+        prompt = options["system_prompt"]
+        self.assertIn("与问题无关/不足以回答时，必须调用 search_web", prompt)
+        self.assertIn("选中资料只是优先参考来源，不限制用户能问的话题", prompt)
+        self.assertIn("普通问答不强行出题", prompt)
+        self.assertIn("覆盖上方自定义提示词及历史对话", prompt)
+
     async def test_empty_scope_or_unconfigured_search_is_rejected_before_agent_runs(self):
         with patch.object(agent, "create_agent") as create:
             with self.assertRaisesRegex(ValueError, "请选择"):

@@ -33,12 +33,12 @@ npm run dev
 
 1. 在“学习资料”导入 `langchain_tutorial` 中的教程，或上传自己的 PDF、DOCX、Markdown、TXT、Python 文件和 notebook。
 2. 每份资料会单独解析、切分、生成向量并保存到 Milvus Lite，可查看切片数量，也可删除。
-3. 在“复盘学习”勾选资料，选择“带我复盘”或“抽查我”，和小晗围绕资料对话。
+3. 在对话顶部展开“资料”下拉，直接搜索和勾选当前会话的资料，支持全选与清空；手机端也不会跳走。资料调整用于下一条消息，会话、已有问答和输入草稿保留。“上传 / 管理资料”入口用于单独管理文件。
 4. Agent 会通过 MCP 搜索工具查找选中资料。回答显示引用文件、命中的片段和 Agent 工具调用过程。
 5. 左侧“历史复习”按最近复习时间排列。点击记录可恢复问答、引用、资料范围、提示词及复盘/抽查模式，并继续同一个会话；点击“新复习”会创建新会话，旧记录保留。
 6. 鼠标移到历史会话上，点击垃圾桶图标并确认即可删除；手机端直接显示删除按钮。删除会话会同时清理问答与 Agent 记忆，保留学习资料。
 7. 回答会逐步显示，检索期间可以查看工具过程。点击输入框右下角的停止按钮可中断生成；已有文字会作为中断记录保留。
-6. 输入框下方的“联网搜索”默认关闭。开启后可补充网上资料，也可以不选文件直接查询主题；“依据与过程”显示本轮实际使用的工具和网页来源。
+8. 输入框下方的“联网搜索”默认关闭。开启后，所选资料无法回答当前问题时会查询网页，也可以不选文件直接查询主题；“依据与过程”显示本轮实际使用的工具和网页来源。即使在抽查模式，用户换话题后也会优先回答新问题。
 
 ## 联网搜索
 
@@ -56,7 +56,13 @@ docker compose up -d --no-deps --no-build --force-recreate backend
 
 已有本机配置可以继续使用；模型 Key 和百炼 Embedding Key 不能代替搜索 Key。没有配置时，“联网搜索”不可用，学习资料复习仍可正常使用。Key 通过运行时环境传给 MCP 子进程，不会发到前端或写进镜像。
 
-关闭开关时，本轮不注册或提供 `search_web` 工具，也不把历史网页引用作为本轮新检索结果。开启后，优先检索选定资料；需要最新信息、版本变化或用户明确要求上网时，Agent 应调用搜索工具，再区分笔记与网上补充。
+关闭开关时，本轮不注册或提供 `search_web` 工具，也不把历史网页引用作为本轮新检索结果。开启后，按下面的规则选择来源：
+
+- 选了资料：先通过 `search_study_materials` 检索；资料为空或检索失败时，由 `RetrievalRoutingMiddleware` 强制下一次模型调用选择 `search_web`。
+- 返回了片段：模型结合本轮问题判断片段是否能回答，不能只看是否非空或相似度高。片段不相关或内容不足时继续调用 `search_web`；足够回答时可直接基于资料作答。
+- 没选资料：直接使用 `search_web`。需要最新信息、版本变化或用户明确要求上网时，也要查询网页。
+
+所选资料是优先参考来源，不限制用户能问的话题。例如选着 LangChain 笔记问游戏玩法，联网开启时应搜索并回答玩法；不会因为笔记没有游戏内容就拒答，也不会强制继续旧的抽查。当前模式与检索规则会覆盖旧自定义提示词和历史拒答中遗留的资料范围限制，无需删除原会话。
 
 搜索一次最多取 5 条网页摘要，不抓取网页全文，不自动将网页写入 Milvus。网页引用展示为链接，资料引用仍跳转资料库；网页不显示向量相似度。搜索超时、认证错误和额度不足会产生中文错误，工具失败仍保留配对的 `ToolMessage`，允许 Agent 围绕已有资料继续讲解，并说明本轮未能核实网上信息。
 
@@ -96,7 +102,7 @@ Vue 联网开关 → POST /api/review/stream → agent.review_stream
 - `backend/app/materials.py`：文件解析、`RecursiveCharacterTextSplitter`、百炼 Qwen3-VL-Embedding（未配置时本地回退）和 Milvus 入库/检索。
 - `backend/app/agent.py`：LangChain `create_agent`、MCP Adapter、系统 Prompt、`astream` 和 PostgreSQL 持久化 Checkpointer。
 - `backend/app/conversations.py`：PostgreSQL 会话/消息表、历史分页查询和旧 checkpoint 记录恢复。
-- `backend/app/middleware.py`：LangChain AgentMiddleware、工具错误处理与中断后的消息修复。
+- `backend/app/middleware.py`：LangChain AgentMiddleware、本轮工具选择与联网回退、工具错误处理和中断后的消息修复。
 - `backend/app/mcp_server.py`：FastMCP 工具如何把资料检索能力提供给 Agent。
 - `backend/app/web_search.py`：Tavily 搜索、网页引用格式、请求超时和中文错误处理。
 - `frontend/src/sources.js`：网页引用链接校验与资料相似度显示。

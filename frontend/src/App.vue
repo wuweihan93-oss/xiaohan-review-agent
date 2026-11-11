@@ -73,6 +73,8 @@ const error = ref('')
 const notice = ref('')
 const mobileNav = ref(false)
 const evidenceOpen = ref(false)
+const materialPicker = ref(null)
+const materialQuery = ref('')
 const chatBody = ref(null)
 const fileInput = ref(null)
 const followAnswer = ref(true)
@@ -83,11 +85,15 @@ let saveTimer
 const busy = computed(() => loading.value || switchingConversation.value || initializing.value || Boolean(deletingConversationId.value))
 const selectedMaterials = computed(() => materials.value.filter((item) => selectedIds.value.has(item.id)))
 const selectedCount = computed(() => selectedMaterials.value.length)
+const filteredMaterials = computed(() => {
+  const query = materialQuery.value.trim().toLocaleLowerCase()
+  return materials.value.filter((item) => `${item.title} ${item.source}`.toLocaleLowerCase().includes(query))
+})
 const totalChunks = computed(() => materials.value.reduce((sum, item) => sum + item.chunk_count, 0))
 const latestSources = computed(() => [...messages.value].reverse().find((item) => item.role === 'assistant')?.sources || [])
 const latestTrace = computed(() => [...messages.value].reverse().find((item) => item.role === 'assistant')?.trace || [])
 const canAsk = computed(() => selectedCount.value > 0 || (webSearchEnabled.value && health.value.web_search_configured))
-const webSearchHint = computed(() => !health.value.web_search_configured ? '请在项目 .env 配置 TAVILY_API_KEY 后重启后端' : webSearchEnabled.value ? '已开启：需要时查询网上资料' : '开启后可查询网上资料')
+const webSearchHint = computed(() => !health.value.web_search_configured ? '请在项目 .env 配置 TAVILY_API_KEY 后重启后端' : webSearchEnabled.value ? '已开启：优先查资料，资料不足或未选资料时自动联网' : '开启后，资料不足或未选资料时可自动联网')
 const currentTitle = computed(() => activeConversationTitle.value || conversations.value.find((item) => item.id === conversationId.value)?.title || '今天想复习什么？')
 
 async function api(path, options = {}) {
@@ -145,6 +151,30 @@ watch(deleteCandidate, async (candidate) => {
     previousFocus?.focus()
   }
 })
+
+watch([conversationId, activePage, busy], () => {
+  if (materialPicker.value) materialPicker.value.open = false
+  materialQuery.value = ''
+})
+
+function closeMaterialPicker(event) {
+  if (materialPicker.value && !materialPicker.value.contains(event.target)) materialPicker.value.open = false
+}
+
+async function openMaterialPicker() {
+  if (busy.value) return
+  evidenceOpen.value = false
+  if (materialPicker.value) {
+    materialPicker.value.open = true
+    await nextTick()
+    materialPicker.value.querySelector('input[type="search"]')?.focus()
+  }
+}
+
+function escapeMaterialPicker() {
+  materialPicker.value.open = false
+  materialPicker.value.querySelector('summary')?.focus()
+}
 
 function dialogKeydown(event) {
   if (event.key === 'Escape' && !deletingConversationId.value) deleteCandidate.value = null
@@ -460,8 +490,12 @@ function openCitation(source) {
   if (source.type !== 'web') activePage.value = 'materials'
 }
 
-onMounted(initialize)
+onMounted(() => {
+  document.addEventListener('pointerdown', closeMaterialPicker)
+  initialize()
+})
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', closeMaterialPicker)
   streamController?.abort()
   clearTimeout(saveTimer)
   saveState()
@@ -521,7 +555,7 @@ onBeforeUnmount(() => {
       <section v-if="activePage === 'materials'" class="materials-page">
         <div class="page-heading">
           <div><div class="page-kicker"><BookOpen :size="14" /> 学习资料</div><h1>你的复习素材</h1><p>把学过的内容放进资料库，复习时选择想看的范围。</p></div>
-          <button class="primary-button" :disabled="importing" @click="importTutorial"><LoaderCircle v-if="importing" :size="16" class="spin" /><ArrowDownToLine v-else :size="16" />{{ importing ? '正在导入并建索引' : '导入 LangChain 笔记' }}</button>
+          <button class="primary-button" :disabled="importing" @click="importTutorial"><LoaderCircle v-if="importing" :size="16" class="spin" /><ArrowDownToLine v-else :size="16" />{{ importing ? '正在导入并建索引' : '导入笔记' }}</button>
         </div>
 
         <div class="material-stats">
@@ -550,7 +584,7 @@ onBeforeUnmount(() => {
             <button class="delete-button" :disabled="deletingId === material.id" :aria-label="`删除 ${material.title}`" title="从项目资料库和向量索引中删除" @click="removeMaterial(material)"><LoaderCircle v-if="deletingId === material.id" :size="16" class="spin" /><Trash2 v-else :size="16" /></button>
           </article>
         </div>
-        <div v-else class="empty-library"><div><BookOpen :size="23" /></div><strong>资料库还是空的</strong><span>先导入教程笔记，或添加自己的学习文件。</span><button class="secondary-button" :disabled="importing" @click="importTutorial"><ArrowDownToLine :size="15" />导入 LangChain 笔记</button></div>
+        <div v-else class="empty-library"><div><BookOpen :size="23" /></div><strong>资料库还是空的</strong><span>先导入教程笔记，或添加自己的学习文件。</span><button class="secondary-button" :disabled="importing" @click="importTutorial"><ArrowDownToLine :size="15" />导入笔记</button></div>
 
         <div class="materials-footer"><span><CircleCheck :size="13" />原始教程笔记不会被修改</span><button :disabled="!selectedCount" @click="activePage = 'review'">用 {{ selectedCount }} 份资料开始复习 <ChevronDown :size="14" /></button></div>
       </section>
@@ -558,8 +592,20 @@ onBeforeUnmount(() => {
       <section v-else class="review-page">
         <div class="review-toolbar" aria-label="复习设置">
           <div class="mode-control" role="group" aria-label="学习模式"><button :disabled="busy" :class="{ active: mode === 'coach' }" :aria-pressed="mode === 'coach'" @click="changeMode('coach')"><Sparkles :size="14" />带我复盘</button><button :disabled="busy" :class="{ active: mode === 'quiz' }" :aria-pressed="mode === 'quiz'" @click="changeMode('quiz')"><CheckCheck :size="14" />抽查我</button></div>
-          <button class="material-scope" :title="selectedCount ? selectedMaterials.map((item) => item.title).join('、') : '选择本轮学习资料'" @click="activePage = 'materials'"><BookOpen :size="14" /><span>{{ selectedCount ? `${selectedCount} 份资料` : '选择资料' }}</span><ChevronDown :size="12" /></button>
-          <button class="evidence-toggle" :aria-expanded="evidenceOpen" aria-controls="review-evidence-panel" @click="evidenceOpen = !evidenceOpen"><Layers3 :size="14" /><span>依据</span><ChevronDown :size="12" :class="{ 'chevron-open': evidenceOpen }" /></button>
+          <details ref="materialPicker" class="material-picker" @keydown.esc.stop="escapeMaterialPicker">
+            <summary class="material-scope" :aria-disabled="busy" aria-controls="conversation-materials" :title="selectedCount ? selectedMaterials.map((item) => item.title).join('、') : '选择本轮学习资料'" @click="busy && $event.preventDefault()"><BookOpen :size="14" /><span>{{ selectedCount ? `${selectedCount} 份资料` : '选择资料' }}</span><ChevronDown :size="12" /></summary>
+            <div id="conversation-materials" class="material-dropdown" role="group" aria-label="当前会话的学习资料">
+              <div class="material-dropdown-head"><div><strong>本次对话的资料</strong><span>已选 {{ selectedCount }} / {{ materials.length }} 份，调整后用于下一条消息</span></div><button class="icon-button" aria-label="收起资料选择" @click="escapeMaterialPicker"><X :size="15" /></button></div>
+              <input v-model="materialQuery" type="search" class="material-filter" aria-label="搜索学习资料" placeholder="搜索资料名称…" />
+              <div class="material-dropdown-actions"><button :disabled="busy || !materials.length" @click="selectAll">全选</button><button :disabled="busy || !selectedCount" @click="clearSelection">清空选择</button></div>
+              <div class="material-dropdown-list">
+                <label v-for="material in filteredMaterials" :key="material.id" class="material-option" :class="{ selected: selectedIds.has(material.id) }"><input type="checkbox" :checked="selectedIds.has(material.id)" :disabled="busy" @change="toggleMaterial(material.id)" /><component :is="sourceIcon(material.source)" :size="15" /><span><strong>{{ material.title }}</strong><small>{{ material.chunk_count }} 个片段 · {{ material.origin === 'upload' ? '上传资料' : '学习笔记' }}</small></span></label>
+                <p v-if="!filteredMaterials.length" class="material-dropdown-empty">{{ materials.length ? '没有找到匹配的资料' : '还没有学习资料，可以先上传文件。' }}</p>
+              </div>
+              <div class="material-dropdown-foot"><span>{{ webSearchEnabled ? '优先查所选资料，资料不足或未选时自动联网。' : '联网已关闭，仅查询所选资料。' }}</span><button @click="activePage = 'materials'">上传 / 管理资料</button></div>
+            </div>
+          </details>
+          <button class="evidence-toggle" :aria-expanded="evidenceOpen" aria-controls="review-evidence-panel" @click="evidenceOpen = !evidenceOpen; materialPicker.open = false"><Layers3 :size="14" /><span>依据</span><ChevronDown :size="12" :class="{ 'chevron-open': evidenceOpen }" /></button>
         </div>
 
         <div v-if="notice" class="notice-line"><CircleCheck :size="15" /><span>{{ notice }}</span><button aria-label="关闭提示" @click="notice = ''"><X :size="14" /></button></div>
@@ -580,7 +626,7 @@ onBeforeUnmount(() => {
                   <button v-if="webSearchEnabled" :disabled="!canAsk" @click="ask('联网查找 LangChain 最新的官方 Agent 文档，讲讲 create_agent 的用法，并附上来源链接。')"><Globe :size="15" /><span>查最新官方文档</span></button>
                   <button v-else :disabled="!canAsk" @click="ask('用一个简单例子比较 LangChain Tool 和 MCP Tool。')"><Sparkles :size="15" /><span>比较 Tool 和 MCP</span></button>
                 </div>
-                <button v-if="!selectedCount" class="choose-materials" @click="activePage = 'materials'"><BookOpen :size="14" />去选择学习资料</button>
+                <button v-if="!selectedCount" class="choose-materials" :disabled="busy" @click="openMaterialPicker"><BookOpen :size="14" />选择本次资料</button>
               </div>
 
               <div v-for="message in messages" :key="message.id" class="message-line" :class="`line-${message.role}`">
@@ -629,7 +675,7 @@ onBeforeUnmount(() => {
               <div v-if="latestSources.length" class="evidence-list"><article v-for="(source, index) in latestSources" :key="`${source.source}-${index}`" class="evidence-card"><div class="evidence-card-title"><component :is="citationIcon(source)" :size="13" /><strong>{{ source.title || source.source }}</strong><small v-if="source.type === 'web'">网页</small><small v-else-if="sourceScoreLabel(source)">{{ sourceScoreLabel(source) }}</small></div><p>{{ source.text }}</p><a v-if="webSourceUrl(source)" class="evidence-path evidence-link" :href="webSourceUrl(source)" target="_blank" rel="noopener noreferrer">{{ source.url }} ↗</a><span v-else class="evidence-path">{{ source.source }}</span></article></div>
               <div v-else class="no-evidence">还没有检索片段</div>
 
-              <div class="selection-box-panel"><div><BookOpen :size="14" /><strong>资料范围</strong></div><span>{{ selectedCount }} 份资料</span><button @click="activePage = 'materials'">更改选择</button></div>
+              <div class="selection-box-panel"><div><BookOpen :size="14" /><strong>资料范围</strong></div><span>{{ selectedCount }} 份资料</span><button :disabled="busy" @click="openMaterialPicker">更改选择</button></div>
               <div class="model-note"><span class="model-dot" :class="{ ready: health.model_configured }"></span><span>{{ health.model_configured ? `${health.model} · OpenAI 兼容接口` : '请在项目 .env 配置 DeepSeek' }}</span></div>
             </div>
           </aside>
