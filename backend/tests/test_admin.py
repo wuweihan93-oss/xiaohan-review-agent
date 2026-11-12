@@ -21,6 +21,22 @@ PASSWORD_HASH = hash_password(PASSWORD)
 
 
 class PasswordTests(unittest.TestCase):
+    def test_local_and_container_setup_accept_eight_characters_but_reject_seven(self):
+        from app import admin_setup
+        spec = importlib.util.spec_from_file_location('local_admin_setup', Path(__file__).resolve().parents[2] / 'scripts/setup_admin.py')
+        local_setup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(local_setup)
+        for setup in (admin_setup, local_setup):
+            with self.subTest(entry=setup.__name__), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / '.env'
+                setup.save_credentials(target, 'admin', 'Abcd1234')
+                saved = target.read_text()
+                encoded = saved.split("ADMIN_PASSWORD_HASH='", 1)[1].split("'", 1)[0]
+                self.assertTrue(verify_password('Abcd1234', encoded))
+                with self.assertRaisesRegex(ValueError, '8 至 256'):
+                    setup.save_credentials(target, 'admin', 'Abcd123')
+                self.assertEqual(saved, target.read_text())
+
     def test_random_salt_verification_and_invalid_hash(self):
         other = hash_password(PASSWORD)
         self.assertNotEqual(PASSWORD_HASH, other)

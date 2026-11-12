@@ -15,8 +15,8 @@ PROJECT = Path(__file__).resolve().parents[2]
 def save_credentials(path: Path, username: str, password: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", username):
         raise ValueError("账号只支持 1 至 64 位英文字母、数字、下划线、点或短横线。")
-    if not 12 <= len(password) <= 256:
-        raise ValueError("管理员密码需要 12 至 256 个字符。")
+    if not 8 <= len(password) <= 256:
+        raise ValueError("管理员密码需要 8 至 256 个字符。")
     path = path.expanduser().resolve()
     original = path.read_text(encoding="utf-8") if path.exists() else ""
     values = {"ADMIN_USERNAME": username, "ADMIN_PASSWORD_HASH": hash_password(password)}
@@ -42,7 +42,7 @@ def main():
     args = parser.parse_args()
     try:
         username = input("管理员账号（直接回车使用 admin）：").strip() or "admin"
-        password = getpass.getpass("管理员密码（至少 12 个字符，输入时不会显示）：")
+        password = getpass.getpass("管理员密码（至少 8 个字符，输入时不会显示）：")
         confirmation = getpass.getpass("请再次输入密码：")
         if password != confirmation:
             raise ValueError("两次密码不一致，配置未修改。")
