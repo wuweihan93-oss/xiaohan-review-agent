@@ -35,4 +35,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8010/api/health', timeout=8)"
 
 # Milvus Lite 使用本地文件，保持单进程；部署时不使用开发模式的 --reload。
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010", "--workers", "1"]
+# 转发头由应用按可信前端地址统一处理，避免 Uvicorn 先接受伪造的来源地址。
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010", "--workers", "1", "--no-proxy-headers"]

@@ -1,5 +1,6 @@
 """历史记录的数据库集成测试：设置 XIAOHAN_POSTGRES_TESTS=1 后运行。"""
 
+import asyncio
 import os
 import unittest
 import uuid
@@ -10,6 +11,7 @@ from psycopg import AsyncConnection
 
 from app import main
 from app.config import DB_URL
+from app.visitors import memory_thread_id
 
 
 @unittest.skipUnless(DB_URL and os.getenv("XIAOHAN_POSTGRES_TESTS") == "1", "需要显式启用 PostgreSQL 集成测试")
@@ -20,6 +22,8 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.lifespan = main.app.router.lifespan_context(main.app)
         await self.lifespan.__aenter__()
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
+        self.visitor = (await self.client.get("/api/visitor")).json()["cache_scope"]
+        self.threads = [memory_thread_id(self.visitor, item) for item in self.ids]
         self.materials = patch("app.main.list_materials", return_value=[{"id": self.material_id}])
         self.materials.start()
 
@@ -48,8 +52,8 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.main.review", new=AsyncMock(return_value=self.answer("资料"))):
             for index, conversation_id in enumerate(self.ids):
                 await self.client.post("/api/review", json=self.request(index))
-                await graph.ainvoke({"messages": [HumanMessage(content="检索资料")]}, {"configurable": {"thread_id": conversation_id}})
-        config = {"configurable": {"thread_id": self.ids[0]}}
+                await graph.ainvoke({"messages": [HumanMessage(content="检索资料")]}, {"configurable": {"thread_id": self.threads[index]}})
+        config = {"configurable": {"thread_id": self.threads[0]}}
         self.assertIsNotNone(await agent._memory.aget_tuple(config))
         response = await self.client.delete(f"/api/conversations/{self.ids[0]}")
         self.assertEqual(response.status_code, 200)
@@ -58,9 +62,9 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         async with await AsyncConnection.connect(DB_URL, autocommit=True) as connection:
             for table in ("xiaohan_messages", "checkpoints", "checkpoint_blobs", "checkpoint_writes"):
                 column = "conversation_id" if table == "xiaohan_messages" else "thread_id"
-                cursor = await connection.execute(f"SELECT count(*) FROM {table} WHERE {column} = %s", (self.ids[0],))
+                cursor = await connection.execute(f"SELECT count(*) FROM {table} WHERE {column} = %s", (self.ids[0] if table == "xiaohan_messages" else self.threads[0],))
                 self.assertEqual((await cursor.fetchone())[0], 0)
-        self.assertIsNotNone(await agent._memory.aget_tuple({"configurable": {"thread_id": self.ids[1]}}))
+        self.assertIsNotNone(await agent._memory.aget_tuple({"configurable": {"thread_id": self.threads[1]}}))
         remaining = await self.client.get(f"/api/conversations/{self.ids[1]}")
         self.assertEqual(len(remaining.json()["conversation"]["messages"]), 2)
         await self.lifespan.__aexit__(None, None, None)
@@ -70,7 +74,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 404)
         repeated = await self.client.delete(f"/api/conversations/{self.ids[0]}")
         self.assertEqual(repeated.status_code, 404)
-        await agent.delete_memory(self.ids[1])
+        await agent.delete_memory(self.threads[1])
 
     async def test_memory_cleanup_failure_preserves_history_for_retry(self):
         with patch("app.main.review", new=AsyncMock(return_value=self.answer("资料"))):
@@ -113,6 +117,66 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
             "answer": "复习回答", "sources": [{"source": source, "text": source}],
             "trace": [{"label": "测试工具", "detail": source}],
         }
+
+    async def test_visitors_cannot_list_read_continue_or_delete_each_others_conversations(self):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as other:
+            with patch("app.main.review", new=AsyncMock(return_value=self.answer("资料"))) as review:
+                await self.client.post("/api/review", json=self.request())
+                await other.post("/api/review", json=self.request(1, question="访客乙的对话"))
+                review.reset_mock()
+                listing = (await other.get("/api/conversations")).json()
+                self.assertEqual(listing["total"], 1)
+                self.assertEqual([item["id"] for item in listing["conversations"]], [self.ids[1]])
+                self.assertNotIn("visitor_id", listing["conversations"][0])
+                denied = [
+                    await other.get(f"/api/conversations/{self.ids[0]}"),
+                    await other.delete(f"/api/conversations/{self.ids[0]}"),
+                    await other.post("/api/review", json=self.request()),
+                    await other.post("/api/review/stream", json=self.request()),
+                ]
+                self.assertTrue(all(response.status_code == 404 for response in denied))
+                self.assertTrue(all("text/event-stream" not in response.headers.get("content-type", "") for response in denied))
+                review.assert_not_awaited()
+            original = (await self.client.get(f"/api/conversations/{self.ids[0]}")).json()["conversation"]
+            self.assertEqual(len(original["messages"]), 2)
+            self.client.cookies.clear()
+            self.assertEqual((await self.client.get("/api/conversations")).json()["total"], 0)
+            self.assertEqual((await self.client.get(f"/api/conversations/{self.ids[0]}")).status_code, 404)
+
+    async def test_unowned_legacy_rows_are_retained_but_cannot_be_claimed(self):
+        async with await AsyncConnection.connect(DB_URL, autocommit=True) as connection:
+            await connection.execute(
+                "INSERT INTO xiaohan_conversations (id, title) VALUES (%s, %s)",
+                (self.ids[0], "升级前的公共记录"),
+            )
+        self.assertEqual((await self.client.get("/api/conversations")).json()["total"], 0)
+        self.assertEqual((await self.client.get(f"/api/conversations/{self.ids[0]}")).status_code, 404)
+        with patch("app.main.review", new=AsyncMock()) as review:
+            response = await self.client.post("/api/review", json=self.request())
+        self.assertEqual(response.status_code, 404)
+        review.assert_not_awaited()
+        async with await AsyncConnection.connect(DB_URL, autocommit=True) as connection:
+            cursor = await connection.execute("SELECT visitor_id, title FROM xiaohan_conversations WHERE id = %s", (self.ids[0],))
+            self.assertEqual(await cursor.fetchone(), (None, "升级前的公共记录"))
+
+    async def test_atomic_creation_collision_and_write_guards(self):
+        from app.conversations import ConversationNotFound, begin_turn, delete_conversation, finish_turn
+        owners = [self.visitor, "another-isolated-visitor"]
+        results = await asyncio.gather(*[
+            begin_turn(self.ids[0], f"问题{index}", [], "coach", None, visitor_id=owner)
+            for index, owner in enumerate(owners)
+        ], return_exceptions=True)
+        self.assertEqual(sum(isinstance(result, ConversationNotFound) for result in results), 1)
+        winner = next(index for index, result in enumerate(results) if not isinstance(result, Exception))
+        loser = owners[1 - winner]
+        with self.assertRaises(ConversationNotFound):
+            await finish_turn(self.ids[0], "越权回答", [], [], visitor_id=loser)
+        cleanup = AsyncMock()
+        self.assertFalse(await delete_conversation(self.ids[0], loser, cleanup))
+        cleanup.assert_not_awaited()
+        async with await AsyncConnection.connect(DB_URL, autocommit=True) as connection:
+            cursor = await connection.execute("SELECT content FROM xiaohan_messages WHERE conversation_id = %s", (self.ids[0],))
+            self.assertEqual(await cursor.fetchall(), [(f"问题{winner}",)])
 
     async def test_restore_after_reconnecting_and_keep_round_citations(self):
         with patch("app.main.review", new=AsyncMock(side_effect=[self.answer("第一轮"), self.answer("第二轮")])):

@@ -109,7 +109,7 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
         queue, lock = asyncio.Queue(), asyncio.Lock()
         finish = AsyncMock(return_value={"id": "saved", "role": "assistant"})
         with patch.object(main, "DB_URL", "隔离测试"), patch.object(main, "begin_turn", new=AsyncMock(return_value={"id": "user"})), patch.object(main, "finish_turn", finish), patch.object(main, "review_stream", stream):
-            task = asyncio.create_task(main._produce_review(main.ChatRequest(**self.request), queue, lock))
+            task = asyncio.create_task(main._produce_review(main.ChatRequest(**self.request), queue, lock, "test-visitor"))
             while (await queue.get())[0] != "token":
                 pass
             if cancel:
@@ -138,7 +138,7 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return {"id": "saved"}
         with patch.object(main, "DB_URL", "隔离测试"), patch.object(main, "begin_turn", new=AsyncMock(return_value={"id": "user"})), patch.object(main, "finish_turn", new=AsyncMock(side_effect=finish)) as saved, patch.object(main, "review_stream", stream):
-            task = asyncio.create_task(main._produce_review(main.ChatRequest(**self.request), asyncio.Queue(), asyncio.Lock()))
+            task = asyncio.create_task(main._produce_review(main.ChatRequest(**self.request), asyncio.Queue(), asyncio.Lock(), "test-visitor"))
             await saving.wait()
             task.cancel()
             release.set()
@@ -149,8 +149,10 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_deletion_rejects_busy_conversation_and_protects_unknown_ids(self):
         lock = asyncio.Lock()
         await lock.acquire()
-        main._conversation_locks["busy-test"] = lock
-        with patch.object(main, "DB_URL", "隔离测试"), patch.object(main, "delete_conversation", new=AsyncMock(return_value=False)) as delete:
+        from app.visitors import memory_thread_id
+        visitor = (await self.client.get("/api/visitor")).json()["cache_scope"]
+        main._conversation_locks[memory_thread_id(visitor, "busy-test")] = lock
+        with patch.object(main, "DB_URL", "隔离测试"), patch.object(main, "check_conversation_access", new=AsyncMock()), patch.object(main, "delete_conversation", new=AsyncMock(return_value=False)) as delete:
             busy = await self.client.delete("/api/conversations/busy-test")
             delete.assert_not_awaited()
             missing = await self.client.delete("/api/conversations/missing-test")

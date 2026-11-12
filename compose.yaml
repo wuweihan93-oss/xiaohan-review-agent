@@ -14,6 +14,8 @@ services:
       XIAOHAN_MILVUS_URI: /app/backend/data/xiaohan.db
       TUTORIAL_DIR: /app/tutorial
       API_BASE_URL: http://127.0.0.1:8010
+      # 只信任同一 Docker 网络中前端 Nginx 覆盖写入的真实来源地址。
+      TRUSTED_PROXY_HOSTS: frontend
     volumes:
       - ./runtime/data:/app/backend/data
       - ./runtime/uploads:/app/backend/uploads

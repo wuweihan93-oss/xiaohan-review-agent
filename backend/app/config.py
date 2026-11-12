@@ -36,6 +36,10 @@ CHAT_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 CHAT_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "")
 DB_URL = os.getenv("DB_URL", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "").strip()
+TRUSTED_PROXY_HOSTS = [value.strip() for value in os.getenv("TRUSTED_PROXY_HOSTS", "").split(",") if value.strip()]
+TRUSTED_PROXY_CIDRS = [value.strip() for value in os.getenv("TRUSTED_PROXY_CIDRS", "").split(",") if value.strip()]
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 

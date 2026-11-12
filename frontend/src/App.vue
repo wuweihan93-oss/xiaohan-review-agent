@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { createId } from './id.js'
+import { prepareVisitorCache } from './visitor-cache.js'
 import { sourceScoreLabel, webSourceUrl } from './sources.js'
 import { readEventStream } from './stream.js'
 import AssistantAnswer from './AssistantAnswer.vue'
@@ -43,13 +44,12 @@ function storedJson(key, fallback) {
 
 const activePage = ref('review')
 const materials = ref([])
-const savedConversationId = localStorage.getItem('xiaohan-conversation')
-const selectedIds = ref(new Set(storedJson('xiaohan-selected-materials', [])))
-const messages = ref(storedJson('xiaohan-messages', []).map((message) => message.streaming ? {
-  ...message, streaming: false, failed: true,
-  content: `${message.content || ''}\n\n[上次生成已中断]`.trim(),
-} : message))
-const conversationId = ref(savedConversationId || createId())
+let savedConversationId = null
+let visitorScope = ''
+const visitorReady = ref(false)
+const selectedIds = ref(new Set())
+const messages = ref([])
+const conversationId = ref(createId())
 const conversations = ref([])
 const historyTotal = ref(0)
 const historyLoading = ref(false)
@@ -61,10 +61,10 @@ let previousFocus = null
 const activeConversationTitle = ref('')
 const switchingConversation = ref(false)
 const initializing = ref(true)
-const mode = ref(localStorage.getItem('xiaohan-mode') || 'coach')
+const mode = ref('coach')
 const question = ref('')
-const systemPrompt = ref(localStorage.getItem('xiaohan-prompt') || '')
-const webSearchEnabled = ref(storedJson('xiaohan-web-search', false) === true)
+const systemPrompt = ref('')
+const webSearchEnabled = ref(false)
 const health = ref({ model_configured: false, counts: { tutorial: 0, upload: 0 } })
 const loading = ref(false)
 const importing = ref(false)
@@ -83,7 +83,7 @@ const stopping = ref(false)
 let streamController = null
 let saveTimer
 
-const busy = computed(() => loading.value || switchingConversation.value || initializing.value || Boolean(deletingConversationId.value))
+const busy = computed(() => !visitorReady.value || loading.value || switchingConversation.value || initializing.value || Boolean(deletingConversationId.value))
 const selectedMaterials = computed(() => materials.value.filter((item) => selectedIds.value.has(item.id)))
 const selectedCount = computed(() => selectedMaterials.value.length)
 const filteredMaterials = computed(() => {
@@ -98,7 +98,7 @@ const webSearchHint = computed(() => !health.value.web_search_configured ? '请�
 const currentTitle = computed(() => activeConversationTitle.value || conversations.value.find((item) => item.id === conversationId.value)?.title || '今天想复习什么？')
 
 async function api(path, options = {}) {
-  const response = await fetch(`${API}${path}`, options)
+  const response = await fetch(`${API}${path}`, { credentials: 'same-origin', ...options })
   let payload
   try {
     payload = await response.json()
@@ -127,6 +127,9 @@ async function refresh() {
 }
 
 function saveState() {
+  if (!visitorReady.value || initializing.value) return
+  // 其他标签页已切换身份时，旧页面不能覆盖新访客的缓存。
+  if (localStorage.getItem('xiaohan-visitor-scope') !== visitorScope) return
   localStorage.setItem('xiaohan-conversation', conversationId.value)
   localStorage.setItem('xiaohan-selected-materials', JSON.stringify([...selectedIds.value]))
   localStorage.setItem('xiaohan-messages', JSON.stringify(messages.value.slice(-40)))
@@ -259,7 +262,29 @@ async function openConversation(id) {
 
 async function initialize() {
   try {
+    // 先串行建立 Cookie，再读取会话，避免首次并发请求各自产生不同身份。
+    const first = await api('/visitor')
+    const confirmed = await api('/visitor')
+    if (first.cache_scope !== confirmed.cache_scope) {
+      throw new Error('浏览器未保存匿名身份，请允许本站 Cookie 后刷新页面。')
+    }
+    prepareVisitorCache(localStorage, confirmed.cache_scope)
+    visitorScope = confirmed.cache_scope
+    savedConversationId = localStorage.getItem('xiaohan-conversation')
+    conversationId.value = savedConversationId || createId()
+    selectedIds.value = new Set(storedJson('xiaohan-selected-materials', []))
+    mode.value = localStorage.getItem('xiaohan-mode') || 'coach'
+    systemPrompt.value = localStorage.getItem('xiaohan-prompt') || ''
+    webSearchEnabled.value = storedJson('xiaohan-web-search', false) === true
+    visitorReady.value = true
     await refresh()
+    // 有数据库时只恢复经过后端归属校验的记录；无数据库时使用本浏览器缓存。
+    if (!health.value.history_enabled) {
+      messages.value = storedJson('xiaohan-messages', []).map((message) => message.streaming ? {
+        ...message, streaming: false, failed: true,
+        content: `${message.content || ''}\n\n[上次生成已中断]`.trim(),
+      } : message)
+    }
     await loadHistory()
     const id = savedConversationId || conversations.value[0]?.id
     if (id && health.value.history_enabled) {
@@ -272,6 +297,9 @@ async function initialize() {
       }
     }
     await scrollToEnd()
+  } catch (caught) {
+    visitorReady.value = false
+    error.value = `初始化复习服务失败：${caught.message}`
   } finally {
     initializing.value = false
   }
@@ -378,6 +406,7 @@ async function ask(text = question.value) {
   await scrollToEnd()
   try {
     const response = await fetch(`${API}/review/stream`, {
+      credentials: 'same-origin',
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: streamController.signal,
@@ -663,7 +692,7 @@ onBeforeUnmount(() => {
                 </div><button v-if="loading" class="send-button" type="button" :disabled="stopping" aria-label="停止生成" title="停止生成" @click="stopAnswer"><Square :size="13" fill="currentColor" /></button><button v-else class="send-button" type="submit" :disabled="busy || !question.trim() || !canAsk" aria-label="发送问题"><ArrowUp :size="18" /></button></div>
               </form>
               <textarea v-if="systemPrompt" v-model="systemPrompt" class="prompt-edit" aria-label="自定义学习提示词" placeholder="写下你希望小晗如何带你复习…"></textarea>
-              <div class="local-note"><CircleCheck :size="12" />{{ webSearchEnabled ? '联网查询会发送给 Tavily，检索摘要与问题交给 DeepSeek 整理' : '资料切片和向量在本地；复习问题及检索片段会发送给 DeepSeek' }}</div>
+              <div class="local-note"><CircleCheck :size="12" /><span>{{ webSearchEnabled ? '联网查询会发送给 Tavily，检索摘要与问题交给 DeepSeek 整理' : '资料切片和向量在本地；复习问题及检索片段会发送给 DeepSeek' }}<template v-if="health.history_enabled">；对话及 IP 将保存，管理员可查看。</template></span></div>
             </div>
           </div>
 

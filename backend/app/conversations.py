@@ -11,8 +11,13 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from app.config import DB_URL
+from app.visitors import memory_thread_id
 
 _pool: AsyncConnectionPool | None = None
+
+
+class ConversationNotFound(Exception):
+    """编号不存在或不属于当前访客，对外统一显示找不到会话。"""
 
 
 @asynccontextmanager
@@ -50,6 +55,14 @@ async def history_context() -> AsyncIterator[None]:
                         ALTER TABLE xiaohan_conversations
                         ADD COLUMN IF NOT EXISTS web_search_enabled BOOLEAN NOT NULL DEFAULT FALSE
                     """)
+                    # 旧记录保留空归属，不向任何匿名访客公开，也不允许自动认领。
+                    await connection.execute("""
+                        ALTER TABLE xiaohan_conversations ADD COLUMN IF NOT EXISTS visitor_id TEXT
+                    """)
+                    await connection.execute("""
+                        CREATE INDEX IF NOT EXISTS xiaohan_conversations_visitor_idx
+                        ON xiaohan_conversations(visitor_id, updated_at DESC, id)
+                    """)
                     await connection.execute("""
                         CREATE TABLE IF NOT EXISTS xiaohan_messages (
                             position BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -67,6 +80,23 @@ async def history_context() -> AsyncIterator[None]:
                         CREATE INDEX IF NOT EXISTS xiaohan_messages_conversation_idx
                         ON xiaohan_messages(conversation_id, position)
                     """)
+                    # 升级前未记录的来源地址保留为空，不用当前请求的地址补写历史。
+                    await connection.execute("""
+                        ALTER TABLE xiaohan_messages ADD COLUMN IF NOT EXISTS client_ip TEXT
+                    """)
+                    await connection.execute("""
+                        CREATE TABLE IF NOT EXISTS xiaohan_admin_sessions (
+                            token_hash TEXT PRIMARY KEY,
+                            csrf_token TEXT NOT NULL,
+                            credential_version TEXT NOT NULL,
+                            expires_at TIMESTAMPTZ NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        )
+                    """)
+                    await connection.execute("""
+                        CREATE INDEX IF NOT EXISTS xiaohan_admin_sessions_expiry_idx
+                        ON xiaohan_admin_sessions(expires_at)
+                    """)
             yield
         finally:
             _pool = None
@@ -78,50 +108,66 @@ def _database() -> AsyncConnectionPool:
     return _pool
 
 
-async def list_conversations(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+async def list_conversations(visitor_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
     if not DB_URL:
         return {"conversations": [], "total": 0, "enabled": False}
     async with _database().connection() as connection:
-        cursor = await connection.execute("SELECT count(*) AS total FROM xiaohan_conversations")
+        cursor = await connection.execute("SELECT count(*) AS total FROM xiaohan_conversations WHERE visitor_id = %s", (visitor_id,))
         total = (await cursor.fetchone())["total"]
         cursor = await connection.execute("""
-            SELECT c.*,
+            SELECT c.id, c.title, c.material_ids, c.study_mode, c.prompt, c.web_search_enabled, c.created_at, c.updated_at,
                 (SELECT count(*) FROM xiaohan_messages m WHERE m.conversation_id = c.id) AS message_count,
                 (SELECT left(content, 80) FROM xiaohan_messages m
                  WHERE m.conversation_id = c.id ORDER BY position DESC LIMIT 1) AS preview
-            FROM xiaohan_conversations c
+            FROM xiaohan_conversations c WHERE c.visitor_id = %s
             ORDER BY c.updated_at DESC, c.id
             LIMIT %s OFFSET %s
-        """, (limit, offset))
+        """, (visitor_id, limit, offset))
         return {"conversations": await cursor.fetchall(), "total": total, "enabled": True}
 
 
-async def get_conversation(conversation_id: str) -> dict[str, Any] | None:
+async def get_conversation(conversation_id: str, visitor_id: str) -> dict[str, Any] | None:
     async with _database().connection() as connection:
         cursor = await connection.execute(
-            "SELECT * FROM xiaohan_conversations WHERE id = %s", (conversation_id,)
+            "SELECT * FROM xiaohan_conversations WHERE id = %s AND visitor_id = %s", (conversation_id, visitor_id)
         )
         conversation = await cursor.fetchone()
         if conversation is None:
             return None
+        # 消息查询也校验归属，防止两次查询之间旧会话被删除、编号被他人重新使用。
         cursor = await connection.execute("""
-            SELECT id, role, content, sources, trace, failed, created_at
-            FROM xiaohan_messages WHERE conversation_id = %s ORDER BY position
-        """, (conversation_id,))
+            SELECT m.id, m.role, m.content, m.sources, m.trace, m.failed, m.created_at
+            FROM xiaohan_messages m JOIN xiaohan_conversations c ON c.id = m.conversation_id
+            WHERE m.conversation_id = %s AND c.visitor_id = %s ORDER BY m.position
+        """, (conversation_id, visitor_id))
+        conversation.pop("visitor_id", None)
         conversation["messages"] = await cursor.fetchall()
         return conversation
 
 
-async def delete_conversation(conversation_id: str, delete_memory: Callable[[str], Awaitable[None]]) -> bool:
+async def check_conversation_access(conversation_id: str, visitor_id: str, *, allow_missing: bool = False) -> None:
+    """在开始生成或返回流式响应前检查归属；写入时还会再次原子校验。"""
+    async with _database().connection() as connection:
+        cursor = await connection.execute(
+            "SELECT visitor_id FROM xiaohan_conversations WHERE id = %s", (conversation_id,)
+        )
+        row = await cursor.fetchone()
+    if row is None and allow_missing:
+        return
+    if row is None or row["visitor_id"] != visitor_id:
+        raise ConversationNotFound()
+
+
+async def delete_conversation(conversation_id: str, visitor_id: str, delete_memory: Callable[[str], Awaitable[None]]) -> bool:
     """只删除本项目的会话；先清理记忆，防止启动时从 checkpoint 恢复已删记录。"""
     async with _database().connection() as connection:
         async with connection.transaction():
             cursor = await connection.execute(
-                "SELECT id FROM xiaohan_conversations WHERE id = %s FOR UPDATE", (conversation_id,)
+                "SELECT id FROM xiaohan_conversations WHERE id = %s AND visitor_id = %s FOR UPDATE", (conversation_id, visitor_id)
             )
             if await cursor.fetchone() is None:
                 return False
-            await delete_memory(conversation_id)
+            await delete_memory(memory_thread_id(visitor_id, conversation_id))
             # 外键级联删除该会话的所有消息，不影响上传资料或其他会话。
             await connection.execute("DELETE FROM xiaohan_conversations WHERE id = %s", (conversation_id,))
     return True
@@ -129,27 +175,31 @@ async def delete_conversation(conversation_id: str, delete_memory: Callable[[str
 
 async def begin_turn(
     conversation_id: str, question: str, material_ids: list[str], study_mode: str, prompt: str | None,
-    *, web_search_enabled: bool = False,
+    *, visitor_id: str, web_search_enabled: bool = False, client_ip: str | None = None,
 ) -> dict[str, Any]:
     message = {"id": str(uuid.uuid4()), "role": "user", "content": question}
     async with _database().connection() as connection:
         async with connection.transaction():
-            await connection.execute("""
-                INSERT INTO xiaohan_conversations (id, title, material_ids, study_mode, prompt, web_search_enabled)
-                VALUES (%s, %s, %s, %s, %s, %s)
+            cursor = await connection.execute("""
+                INSERT INTO xiaohan_conversations (id, title, material_ids, study_mode, prompt, web_search_enabled, visitor_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET material_ids = EXCLUDED.material_ids,
                     study_mode = EXCLUDED.study_mode, prompt = EXCLUDED.prompt,
                     web_search_enabled = EXCLUDED.web_search_enabled, updated_at = now()
-            """, (conversation_id, " ".join(question.split())[:40], Jsonb(material_ids), study_mode, prompt, web_search_enabled))
+                WHERE xiaohan_conversations.visitor_id = EXCLUDED.visitor_id
+                RETURNING id
+            """, (conversation_id, " ".join(question.split())[:40], Jsonb(material_ids), study_mode, prompt, web_search_enabled, visitor_id))
+            if not await cursor.fetchone():
+                raise ConversationNotFound()
             await connection.execute("""
-                INSERT INTO xiaohan_messages (id, conversation_id, role, content)
-                VALUES (%s, %s, 'user', %s)
-            """, (message["id"], conversation_id, question))
+                INSERT INTO xiaohan_messages (id, conversation_id, role, content, client_ip)
+                VALUES (%s, %s, 'user', %s, %s)
+            """, (message["id"], conversation_id, question, client_ip))
     return message
 
 
 async def finish_turn(
-    conversation_id: str, content: str, sources: list, trace: list, *, failed: bool = False
+    conversation_id: str, content: str, sources: list, trace: list, *, visitor_id: str, failed: bool = False
 ) -> dict[str, Any]:
     message = {
         "id": str(uuid.uuid4()), "role": "assistant", "content": content,
@@ -157,6 +207,12 @@ async def finish_turn(
     }
     async with _database().connection() as connection:
         async with connection.transaction():
+            cursor = await connection.execute(
+                "SELECT id FROM xiaohan_conversations WHERE id = %s AND visitor_id = %s FOR UPDATE",
+                (conversation_id, visitor_id),
+            )
+            if not await cursor.fetchone():
+                raise ConversationNotFound()
             await connection.execute("""
                 INSERT INTO xiaohan_messages (id, conversation_id, role, content, sources, trace, failed)
                 VALUES (%s, %s, 'assistant', %s, %s, %s, %s)
@@ -177,7 +233,7 @@ async def backfill_conversations(checkpointer: Any) -> int:
     async with _database().connection() as connection:
         cursor = await connection.execute("""
             SELECT DISTINCT thread_id FROM checkpoints
-            WHERE checkpoint_ns = '' AND thread_id NOT IN (SELECT id FROM xiaohan_conversations)
+            WHERE checkpoint_ns = '' AND thread_id NOT LIKE 'visitor:%' AND thread_id NOT IN (SELECT id FROM xiaohan_conversations)
         """)
         candidates = await cursor.fetchall()
     imported = 0

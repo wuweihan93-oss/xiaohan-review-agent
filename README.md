@@ -10,7 +10,7 @@
 cd /Users/williams/Conda/xiaohan-review-agent
 cd backend
 uv sync
-uv run uvicorn app.main:app --reload --port 8010
+uv run uvicorn app.main:app --reload --port 8010 --no-proxy-headers
 ```
 
 另开终端：
@@ -80,11 +80,52 @@ Vue 联网开关 → POST /api/review/stream → agent.review_stream
 
 ## 对话记录与记忆
 
-`DB_URL` 指向同一套 PostgreSQL。服务启动时自动创建 `xiaohan_conversations`（标题、资料范围、模式和时间）及 `xiaohan_messages`（逐条问答、引用和工具过程）。LangGraph 自身的 checkpoint 表保存 Agent 的上下文状态。会话 ID 同时关联页面历史与 Agent 记忆，刷新页面或重启后端后仍能继续复习。新会话会在发出第一条问题时保存；生成失败的问题与错误提示也会保留。
+`DB_URL` 指向同一套 PostgreSQL。服务启动时自动创建 `xiaohan_conversations`（标题、资料范围、模式和时间）及 `xiaohan_messages`（逐条问答、引用和工具过程）。LangGraph 自身的 checkpoint 表保存 Agent 的上下文状态。公开会话 ID 关联页面历史；Agent 的 checkpoint ID 由访客摘要和会话 ID 共同生成，避免不同访客共享记忆。刷新页面或重启后端后仍能继续复习。新会话会在发出第一条问题时保存；生成失败的问题与错误提示也会保留。
 
-旧版 PostgreSQL checkpoint 中能通过小晗专用检索工具确认归属的对话，会在启动时补入历史列表。早期未保存的模式和提示词采用默认值，资料范围从引用片段还原，可在继续复习前调整。数据库中的其他教程 Agent 对话不会混入列表。未配置 `DB_URL` 时仍能使用内存 Agent，但不启用服务端历史记录。
+旧版 PostgreSQL checkpoint 中能通过小晗专用检索工具确认归属的对话，会在启动时补入无归属的存档，仅保留在数据库。早期未保存的模式和提示词采用默认值，资料范围从引用片段还原。数据库中的其他教程 Agent 对话不会混入列表。未配置 `DB_URL` 时仍能使用内存 Agent，但不启用服务端历史记录。
 
-这是供本地单人使用的学习项目，历史列表展示本项目保存的全部会话。
+### 匿名访客身份（无需登录）
+
+每个浏览器首次访问会自动取得一个随机的 `HttpOnly` Cookie（有效期一年）。同一浏览器刷新页面或重新打开，可以继续查看自己的会话；手机、电脑、不同浏览器及独立的无痕窗口分别拥有独立身份。同一浏览器的多个标签页共享身份。它区分的是浏览器，不是现实中的人，也不提供跨设备同步。
+
+前端先调用 `GET /api/visitor` 确认身份，再加载历史。后端在会话列表、详情、普通/流式续聊和删除时校验归属，不能靠换一个会话编号访问他人记录。数据库只保存匿名令牌的 SHA-256 摘要；原始令牌只通过 Cookie 传递，不返回在 JSON 中。模型记忆也按访客隔离，无数据库模式同样不会串上下文。
+
+清除 Cookie、Cookie 到期或无痕会话结束后，会产生新身份，原身份的记录无法从新身份找回。前端会移除不匹配的本地聊天缓存。请允许本站 Cookie，并使用固定的网站地址访问；`localhost`、IP 地址和不同域名的 Cookie 不通用。HTTP 和 HTTPS 均可使用；直接通过 HTTPS 访问后端时 Cookie 会带 `Secure`，使用 HTTPS 反向代理时需正确配置可信代理及转发协议。
+
+升级时会自动给 `xiaohan_conversations` 增加 `visitor_id` 列和索引。**旧公共记录与旧 checkpoint 保留在数据库，但没有可靠的访客归属，不向任何新访客展示，也不会自动分配给第一个打开网页的人。** 新记录从第一条消息开始绑定访客；新 checkpoint 不再被旧记录补录逻辑重复导入。
+
+本次只隔离会话与对话记忆，上传资料和向量资料库仍然共享。暂未增加定时任务或过期数据清理，已有的手动删除会话功能继续可用。
+
+### 管理员后台
+
+后台入口是 `/admin`，本机访问 <http://127.0.0.1:5174/admin>。访客无需登录，管理员使用单独的账号密码。后台以问答表格为主，列为“用户、时间、问题、回答、IP 地址、详情”，每行对应一轮提问及紧接其后的助手回答。可以搜索用户标识、IP、问题或回答，点击用户编号筛选该访客，支持分页、旧版记录筛选和展开完整内容；展开后的 AI 回答支持 Markdown 和复制。访客标识用于区分浏览器，不能据此识别真实姓名。
+
+先在项目根目录交互设置管理员账号和至少 12 位的密码：
+
+```bash
+python3 scripts/setup_admin.py
+```
+
+脚本仅使用 Python 标准库，在项目 `.env` 保存 `ADMIN_USERNAME` 和带随机盐的 `ADMIN_PASSWORD_HASH`，保留原有配置，不输出或保存明文密码。不要把这个 `.env` 提交到 GitHub，也不要把密码放在前端。未设置密码或未配置 `DB_URL` 时后台关闭，不提供默认密码。设置完成后重启后端，再进入 `/admin` 登录。
+
+Ubuntu 通过 CI/CD 更新镜像后，即使服务器源码未同步，也可以在当前部署目录运行容器里的设置工具，将配置写入服务器 `.env`（使用当前用户，避免文件变成 root 所有）：
+
+```bash
+cd ~/apps/xiaohan-review-agent
+docker compose run --rm --no-deps --user "$(id -u):$(id -g)" --volume "$PWD:/setup" backend \
+  python -m app.admin_setup --env-file /setup/.env
+docker compose up -d --no-deps --no-build --force-recreate backend
+```
+
+登录 Cookie 与匿名访客 Cookie 分开，使用 `HttpOnly`、`SameSite=Strict`，有效期 8 小时；服务端保存登录令牌摘要，退出即撤销。修改账号或密码并重启后端会使原有管理员会话失效。登录接口按连接来源限流（每分钟 5 次，进程总计每分钟 30 次），后台操作校验来源和 CSRF 令牌，接口禁止缓存；后台不会把管理权限授予公开的访客接口。当前为单进程部署，限流状态在进程内，重启会重置；未配置可信代理时，共用反向代理的请求会共享来源限额。
+
+页面每 5 秒刷新已保存的记录，切到其他标签页会暂停查询，返回时立即刷新。访客问题保存后即可出现，AI 回答完成或中断并保存后出现，不显示尚未落库的生成片段。查看表格时保留滚动位置。若问题之后还没有保存助手消息，回答列显示“等待回答保存”，不会错误配对下一轮的回答。访客手动删除的会话也会从后台消失，因此这不是独立的审计备份。本次没有增加定时任务。
+
+会话表和消息表自动迁移，消息表增加 `client_ip` 列。IP 按每次提问记录，普通接口和流式接口均生效；旧消息未记录过的 IP 保持为空，后台显示“未记录”，不会用管理员当前地址或代理地址填补历史。
+
+直接请求记录连接来源；仅当连接来自 `TRUSTED_PROXY_HOSTS` 或 `TRUSTED_PROXY_CIDRS` 指定的可信代理时，才接受其 `X-Real-IP`。Compose 已设置 `TRUSTED_PROXY_HOSTS=frontend`，后端通过 Docker DNS 确认前端服务的地址，可信代理中间件统一识别 IP 和转发协议，Nginx 使用 `$remote_addr` 覆盖请求头，不采用用户自带的转发链。无法确认可信来源时回退为连接地址。容器及推荐启动命令禁用 Uvicorn 自动处理转发头，防止地址在到达应用校验前被改写。自建反向代理可在 `.env` 指定可信代理主机或网段（逗号分隔），不要信任所有公网地址。若前面还有 CDN 或其他代理，需在 Nginx 另行配置可信来源，否则记录的是该层代理的地址；IP 不是身份认证依据，也不代表具体个人。
+
+聊天输入区已提示“对话及 IP 将保存，管理员可查看”。公网后台应通过 **HTTPS** 访问：HTTP 会明文传输管理员密码和 Cookie。若在反向代理终止 HTTPS，需配置可信代理，并由该代理覆盖写入正确的 `X-Forwarded-Proto`；Nginx 已保留完整 `Host`（含端口）用于同源校验。不要对互联网暴露后端端口，也不要把任意来源的转发头都当成可信信息。服务器和数据库访问权限、公开资料库权限及模型调用额度仍需分别管理，查看后台不等于自动防滥用。
 
 ### 流式回答与删除会话
 
@@ -103,6 +144,12 @@ Vue 联网开关 → POST /api/review/stream → agent.review_stream
 - `backend/app/materials.py`：文件解析、`RecursiveCharacterTextSplitter`、百炼 Qwen3-VL-Embedding（未配置时本地回退）和 Milvus 入库/检索。
 - `backend/app/agent.py`：LangChain `create_agent`、MCP Adapter、系统 Prompt、`astream` 和 PostgreSQL 持久化 Checkpointer。
 - `backend/app/conversations.py`：PostgreSQL 会话/消息表、历史分页查询和旧 checkpoint 记录恢复。
+- `backend/app/client_info.py`：来源 IP 记录与可信反向代理地址校验。
+- `backend/app/visitors.py`：匿名 Cookie、访客摘要和按访客隔离的 checkpoint 编号。
+- `backend/app/admin.py`、`admin_store.py`：独立管理员登录、会话撤销、只读查询和登录限流。
+- `scripts/setup_admin.py`、`backend/app/admin_setup.py`：交互设置管理员账号及密码摘要，本机和容器都可运行。
+- `frontend/src/AdminApp.vue`：后台问答表格、搜索筛选、完整回答展开和自动刷新。
+- `frontend/src/visitor-cache.js`：身份更换时移除旧访客的本地聊天缓存。
 - `backend/app/middleware.py`：LangChain AgentMiddleware、本轮工具选择与联网回退、工具错误处理和中断后的消息修复。
 - `backend/app/mcp_server.py`：FastMCP 工具如何把资料检索能力提供给 Agent。
 - `backend/app/web_search.py`：Tavily 搜索、网页引用格式、请求超时和中文错误处理。
