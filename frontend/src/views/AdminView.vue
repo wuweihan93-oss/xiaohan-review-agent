@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ArrowLeft, ChevronLeft, ChevronRight, LockKeyhole, LogOut, RefreshCw, Search, ShieldCheck, X } from 'lucide-vue-next'
-import AssistantAnswer from './AssistantAnswer.vue'
+import AssistantAnswer from '../components/chat/AssistantAnswer.vue'
+import { adminRequest } from '../api/admin.js'
 
 const session = ref(null)
 const username = ref('admin'), password = ref('')
@@ -27,18 +28,12 @@ function clearSession() {
   overview.value = { conversations: 0, visitors: 0, messages: 0, legacy_conversations: 0 }
 }
 async function api(path, options = {}) {
-  const response = await fetch(`/api/admin${path}`, {
-    credentials: 'same-origin', ...options,
-    headers: { Accept: 'application/json', ...options.headers },
-  })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    if (response.status === 401) clearSession()
-    const failure = new Error(body.detail || `后台请求失败（${response.status}）`)
-    failure.status = response.status
-    throw failure
+  try {
+    return await adminRequest(path, options)
+  } catch (error) {
+    if (error.status === 401) clearSession()
+    throw error
   }
-  return body
 }
 async function login() {
   if (loggingIn.value) return

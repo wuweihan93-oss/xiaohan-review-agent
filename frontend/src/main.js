@@ -1,9 +1,6 @@
 import { createApp } from 'vue'
 import './style.css'
+import App from './App.vue'
+import router from './router/index.js'
 
-// 后台独立加载，不增加普通聊天页面的登录流程。
-const component = /^\/admin(?:\/|$)/.test(window.location.pathname)
-  ? import('./AdminApp.vue')
-  : import('./App.vue')
-
-component.then(({ default: App }) => createApp(App).mount('#app'))
+createApp(App).use(router).mount('#app')

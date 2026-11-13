@@ -1,8 +1,8 @@
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { Check, Copy, LoaderCircle } from 'lucide-vue-next'
-import { renderMarkdown } from './markdown.js'
-import { copyText } from './clipboard.js'
+import { renderMarkdown } from '../../markdown.js'
+import { copyText } from '../../clipboard.js'
 
 const props = defineProps({
   content: { type: String, default: '' },
