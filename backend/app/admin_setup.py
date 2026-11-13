@@ -3,11 +3,11 @@
 import argparse
 import getpass
 import os
-from pathlib import Path
 import re
 import tempfile
+from pathlib import Path
 
-from app.admin_password import hash_password
+from app.security.passwords import hash_password
 
 PROJECT = Path(__file__).resolve().parents[2]
 
@@ -19,14 +19,25 @@ def save_credentials(path: Path, username: str, password: str) -> None:
         raise ValueError("管理员密码需要 8 至 256 个字符。")
     path = path.expanduser().resolve()
     original = path.read_text(encoding="utf-8") if path.exists() else ""
-    values = {"ADMIN_USERNAME": username, "ADMIN_PASSWORD_HASH": hash_password(password)}
-    lines = [line for line in original.splitlines() if not re.match(r"^\s*(?:export\s+)?ADMIN_(?:USERNAME|PASSWORD_HASH)\s*=", line)]
+    values = {
+        "ADMIN_USERNAME": username,
+        "ADMIN_PASSWORD_HASH": hash_password(password),
+    }
+    lines = [
+        line
+        for line in original.splitlines()
+        if not re.match(r"^\s*(?:export\s+)?ADMIN_(?:USERNAME|PASSWORD_HASH)\s*=", line)
+    ]
     # 单引号防止 Docker Compose 把摘要里的 $ 解释成环境变量。
-    updated = "\n".join([*lines, "", *(f"{key}='{value}'" for key, value in values.items()), ""])
+    updated = "\n".join(
+        [*lines, "", *(f"{key}='{value}'" for key, value in values.items()), ""]
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, encoding="utf-8", delete=False) as stream:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=path.parent, encoding="utf-8", delete=False
+        ) as stream:
             temporary = Path(stream.name)
             stream.write(updated)
         os.chmod(temporary, 0o600)
@@ -38,7 +49,9 @@ def save_credentials(path: Path, username: str, password: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env-file", type=Path, default=PROJECT / ".env", help="要写入的项目 .env 路径")
+    parser.add_argument(
+        "--env-file", type=Path, default=PROJECT / ".env", help="要写入的项目 .env 路径"
+    )
     args = parser.parse_args()
     try:
         username = input("管理员账号（直接回车使用 admin）：").strip() or "admin"

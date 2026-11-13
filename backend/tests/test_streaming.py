@@ -6,12 +6,15 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGenerationChunk
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 
-from app import agent, main
+from app.services import review as review_service
+from app.services import conversations as conversation_service
+from app import main
+from app.agents import review as agent
 from test_tool_recovery import StrictToolModel, call
 
 
@@ -38,7 +41,7 @@ class AgentStreamingTests(unittest.IsolatedAsyncioTestCase):
             AIMessage(content="逐步回答"),
         ])
         client = Mock(get_tools=AsyncMock(return_value=[search_study_materials]))
-        with patch.object(agent, "_memory", memory), patch.object(agent, "_chat_model", return_value=model), patch.object(agent, "_mcp_client", return_value=client):
+        with patch.object(agent.memory, "_memory", memory), patch.object(agent, "_chat_model", return_value=model), patch.object(agent, "_mcp_client", return_value=client):
             events = [item async for item in agent.review_stream(question="检索", conversation_id="stream-test", material_ids=["资料"], study_mode="coach")]
         draft = ""
         tokens = []
@@ -59,7 +62,7 @@ class AgentStreamingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_token_arrives_before_model_finishes(self):
         client = Mock(get_tools=AsyncMock(return_value=[]))
-        with patch.object(agent, "_memory", InMemorySaver()), patch.object(agent, "_chat_model", return_value=FakeListChatModel(responses=["分段回答"], sleep=0.01)), patch.object(agent, "_mcp_client", return_value=client):
+        with patch.object(agent.memory, "_memory", InMemorySaver()), patch.object(agent, "_chat_model", return_value=FakeListChatModel(responses=["分段回答"], sleep=0.01)), patch.object(agent, "_mcp_client", return_value=client):
             stream = agent.review_stream(question="问题", conversation_id="first-token", material_ids=["资料"], study_mode="coach")
             async for item in stream:
                 if item["event"] == "token":
@@ -70,7 +73,7 @@ class AgentStreamingTests(unittest.IsolatedAsyncioTestCase):
 
     def test_reasoning_and_tool_arguments_are_not_visible_answer_text(self):
         message = AIMessageChunk(content=[{"type": "reasoning", "text": "隐藏推理"}, {"type": "text", "text": "可见回答"}])
-        self.assertEqual(agent._message_text(message), "可见回答")
+        self.assertEqual(agent.message_text(message), "可见回答")
 
 
 class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
@@ -83,7 +86,7 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
         async def stream(**options):
             yield {"event": "token", "data": {"text": "你好"}}
             yield {"event": "result", "data": {"answer": "你好", "sources": [], "trace": []}}
-        with patch.object(main, "DB_URL", ""), patch.object(main, "list_materials", return_value=[{"id": "资料"}]), patch.object(main, "review_stream", stream):
+        with patch.object(review_service, "DB_URL", ""), patch.object(conversation_service, "DB_URL", ""), patch.object(review_service, "list_materials", return_value=[{"id": "资料"}]), patch.object(review_service, "review_stream", stream):
             response = await self.client.post("/api/review/stream", json=self.request)
         self.assertIn("text/event-stream", response.headers["content-type"])
         self.assertEqual(response.headers["x-accel-buffering"], "no")
@@ -92,7 +95,7 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('event: error', response.text)
 
     async def test_invalid_scope_is_normal_http_error_before_stream(self):
-        with patch.object(main, "begin_turn", new=AsyncMock()) as begin:
+        with patch.object(review_service, "begin_turn", new=AsyncMock()) as begin:
             response = await self.client.post("/api/review/stream", json={"question": "问题"})
         self.assertEqual(response.status_code, 400)
         begin.assert_not_awaited()
@@ -108,8 +111,8 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("模拟断流")
         queue, lock = asyncio.Queue(), asyncio.Lock()
         finish = AsyncMock(return_value={"id": "saved", "role": "assistant"})
-        with patch.object(main, "DB_URL", "隔离测试"), patch.object(main, "begin_turn", new=AsyncMock(return_value={"id": "user"})), patch.object(main, "finish_turn", finish), patch.object(main, "review_stream", stream):
-            task = asyncio.create_task(main._produce_review(main.ChatRequest(**self.request), queue, lock, "test-visitor"))
+        with patch.object(review_service, "DB_URL", "隔离测试"), patch.object(review_service, "begin_turn", new=AsyncMock(return_value={"id": "user"})), patch.object(review_service, "finish_turn", finish), patch.object(review_service, "review_stream", stream):
+            task = asyncio.create_task(review_service._produce_review(review_service.ChatRequest(**self.request), queue, lock, "test-visitor"))
             while (await queue.get())[0] != "token":
                 pass
             if cancel:
@@ -137,8 +140,8 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
             saving.set()
             await release.wait()
             return {"id": "saved"}
-        with patch.object(main, "DB_URL", "隔离测试"), patch.object(main, "begin_turn", new=AsyncMock(return_value={"id": "user"})), patch.object(main, "finish_turn", new=AsyncMock(side_effect=finish)) as saved, patch.object(main, "review_stream", stream):
-            task = asyncio.create_task(main._produce_review(main.ChatRequest(**self.request), asyncio.Queue(), asyncio.Lock(), "test-visitor"))
+        with patch.object(review_service, "DB_URL", "隔离测试"), patch.object(review_service, "begin_turn", new=AsyncMock(return_value={"id": "user"})), patch.object(review_service, "finish_turn", new=AsyncMock(side_effect=finish)) as saved, patch.object(review_service, "review_stream", stream):
+            task = asyncio.create_task(review_service._produce_review(review_service.ChatRequest(**self.request), asyncio.Queue(), asyncio.Lock(), "test-visitor"))
             await saving.wait()
             task.cancel()
             release.set()
@@ -149,10 +152,10 @@ class StreamingApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_deletion_rejects_busy_conversation_and_protects_unknown_ids(self):
         lock = asyncio.Lock()
         await lock.acquire()
-        from app.visitors import memory_thread_id
+        from app.security.visitors import memory_thread_id
         visitor = (await self.client.get("/api/visitor")).json()["cache_scope"]
-        main._conversation_locks[memory_thread_id(visitor, "busy-test")] = lock
-        with patch.object(main, "DB_URL", "隔离测试"), patch.object(main, "check_conversation_access", new=AsyncMock()), patch.object(main, "delete_conversation", new=AsyncMock(return_value=False)) as delete:
+        conversation_service.conversation_locks[memory_thread_id(visitor, "busy-test")] = lock
+        with patch.object(conversation_service, "DB_URL", "隔离测试"), patch.object(conversation_service, "check_conversation_access", new=AsyncMock()), patch.object(conversation_service, "delete_conversation", new=AsyncMock(return_value=False)) as delete:
             busy = await self.client.delete("/api/conversations/busy-test")
             delete.assert_not_awaited()
             missing = await self.client.delete("/api/conversations/missing-test")

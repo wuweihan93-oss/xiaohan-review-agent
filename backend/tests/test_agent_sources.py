@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from app import agent
+from app.agents import review as agent
 
 
 class AgentSourcesTests(unittest.IsolatedAsyncioTestCase):
@@ -22,7 +22,7 @@ class AgentSourcesTests(unittest.IsolatedAsyncioTestCase):
         ]})
         client = Mock()
         client.get_tools = AsyncMock(return_value=[])
-        with patch.object(agent, "_memory", object()), patch.object(agent, "_mcp_client", return_value=client), patch.object(agent, "_chat_model"), patch.object(agent, "create_agent", return_value=graph):
+        with patch.object(agent.memory, "_memory", object()), patch.object(agent, "_mcp_client", return_value=client), patch.object(agent, "_chat_model"), patch.object(agent, "create_agent", return_value=graph):
             result = await agent.review(question="新问题", conversation_id="test", material_ids=["资料"], study_mode="coach")
         self.assertEqual(result["answer"], "新回答")
         self.assertEqual([item["source"] for item in result["sources"]], ["新资料"])
@@ -32,7 +32,7 @@ class AgentSourcesTests(unittest.IsolatedAsyncioTestCase):
         graph.ainvoke = AsyncMock(return_value={"messages": [HumanMessage(content="问题"), *(tool_messages or []), AIMessage(content="回答")]})
         client = Mock()
         client.get_tools = AsyncMock(return_value=[SimpleNamespace(name=name) for name in ("search_web", "search_study_materials", "list_selected_materials")])
-        with patch.object(agent, "TAVILY_API_KEY", "测试密钥"), patch.object(agent, "_memory", object()), patch.object(agent, "_mcp_client", return_value=client) as mcp, patch.object(agent, "_chat_model"), patch.object(agent, "create_agent", return_value=graph) as create:
+        with patch.object(agent, "TAVILY_API_KEY", "测试密钥"), patch.object(agent.memory, "_memory", object()), patch.object(agent, "_mcp_client", return_value=client) as mcp, patch.object(agent, "_chat_model"), patch.object(agent, "create_agent", return_value=graph) as create:
             result = await agent.review(question="问题", conversation_id="测试", material_ids=["资料"] if material_ids is None else material_ids, study_mode="coach", web_search_enabled=enabled)
         return result, create.call_args.kwargs, mcp.call_args
 

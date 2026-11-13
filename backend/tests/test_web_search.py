@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from app import web_search
+from app.integrations import web_search
 
 
 class WebSearchTests(unittest.IsolatedAsyncioTestCase):

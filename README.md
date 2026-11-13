@@ -72,7 +72,7 @@ docker compose up -d --no-deps --no-build --force-recreate backend
 开发时可以沿着下面的调用链复盘：
 
 ```text
-Vue 联网开关 → POST /api/review/stream → agent.review_stream
+Vue 联网开关 → POST /api/review/stream → agents/review.py 的 review_stream
     → MultiServerMCPClient → search_web MCP 工具
     → web_search.py 调用 Tavily → ToolMessage 返回网页摘要
     → 模型整理回答 → PostgreSQL 保存引用 → Vue 展示网页链接
@@ -141,22 +141,24 @@ docker compose up -d --no-deps --no-build --force-recreate backend
 
 ## 跟着代码复盘
 
-- `backend/app/materials.py`：文件解析、`RecursiveCharacterTextSplitter`、百炼 Qwen3-VL-Embedding（未配置时本地回退）和 Milvus 入库/检索。
-- `backend/app/agent.py`：LangChain `create_agent`、MCP Adapter、系统 Prompt、`astream` 和 PostgreSQL 持久化 Checkpointer。
-- `backend/app/conversations.py`：PostgreSQL 会话/消息表、历史分页查询和旧 checkpoint 记录恢复。
-- `backend/app/client_info.py`：来源 IP 记录与可信反向代理地址校验。
-- `backend/app/visitors.py`：匿名 Cookie、访客摘要和按访客隔离的 checkpoint 编号。
-- `backend/app/admin.py`、`admin_store.py`：独立管理员登录、会话撤销、只读查询和登录限流。
+先阅读 [后端开发与学习指南](backend/README.md)：包含按职责分层的目录、两条请求流程、配置位置和新增功能步骤。
+
+- `backend/app/services/materials.py`、`backend/app/rag/`：文件解析、`RecursiveCharacterTextSplitter`、百炼 Qwen3-VL-Embedding（未配置时本地回退）和 Milvus 入库/检索。
+- `backend/app/agents/review.py`：LangChain `create_agent`、MCP Adapter、系统 Prompt、`astream` 和 PostgreSQL 持久化 Checkpointer。
+- `backend/app/repositories/conversations.py`：PostgreSQL 会话/消息表、历史分页查询和旧 checkpoint 记录恢复。
+- `backend/app/security/client_info.py`：来源 IP 记录与可信反向代理地址校验。
+- `backend/app/security/visitors.py`：匿名 Cookie、访客摘要和按访客隔离的 checkpoint 编号。
+- `backend/app/api/routes/admin.py`、`backend/app/repositories/admin.py`：独立管理员登录、会话撤销、只读查询和登录限流。
 - `scripts/setup_admin.py`、`backend/app/admin_setup.py`：交互设置管理员账号及密码摘要，本机和容器都可运行。
-- `frontend/src/AdminApp.vue`：后台问答表格、搜索筛选、完整回答展开和自动刷新。
+- `frontend/src/views/AdminView.vue`：后台问答表格、搜索筛选、完整回答展开和自动刷新。
 - `frontend/src/visitor-cache.js`：身份更换时移除旧访客的本地聊天缓存。
-- `backend/app/middleware.py`：LangChain AgentMiddleware、本轮工具选择与联网回退、工具错误处理和中断后的消息修复。
-- `backend/app/mcp_server.py`：FastMCP 工具如何把资料检索能力提供给 Agent。
-- `backend/app/web_search.py`：Tavily 搜索、网页引用格式、请求超时和中文错误处理。
+- `backend/app/agents/middleware.py`：LangChain AgentMiddleware、本轮工具选择与联网回退、工具错误处理和中断后的消息修复。
+- `backend/app/integrations/mcp/server.py`：FastMCP 工具如何把资料检索能力提供给 Agent。
+- `backend/app/integrations/web_search.py`：Tavily 搜索、网页引用格式、请求超时和中文错误处理。
 - `frontend/src/sources.js`：网页引用链接校验与资料相似度显示。
 - `frontend/src/stream.js`：SSE 网络拆包解析与中文字符解码。
-- `frontend/src/AssistantAnswer.vue`、`markdown.js` 和 `clipboard.js`：AI 回答的 Markdown 排版、代码高亮与剪贴板复制。Markdown 禁用原始 HTML，链接只允许安全的 HTTP / HTTPS 地址。
-- `backend/app/main.py`：FastAPI 上传/导入/删除资料和聊天接口。
-- `frontend/src/App.vue`：资料导入和复习对话交互。
+- `frontend/src/components/chat/AssistantAnswer.vue`、`markdown.js` 和 `clipboard.js`：AI 回答的 Markdown 排版、代码高亮与剪贴板复制。Markdown 禁用原始 HTML，链接只允许安全的 HTTP / HTTPS 地址。
+- `backend/app/main.py`：FastAPI 路由、中间件和生命周期装配；具体接口在 `api/routes/`，业务流程在 `services/`。
+- `frontend/src/views/StudyView.vue` 与 `components/`：资料导入和复习对话交互；`router/` 管理路由，`api/` 管理接口请求。
 
 教程目录只用于第一次导入；导入后资料在本项目的 Milvus Lite 数据库中管理，上传文件保存在本项目的 `backend/uploads/`。删除项目资料不会删除你的原教程文件。

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from app import materials
+from app.services import materials
 
 PROJECT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("package_deploy", PROJECT / "scripts/package_deploy.py")
@@ -64,8 +64,8 @@ class UploadMigrationTests(unittest.TestCase):
             target = uploads / filename
             target.write_text("测试资料", encoding="utf-8")
             registry_path = root / "materials.sqlite3"
-            with patch.object(materials, "REGISTRY_PATH", registry_path), patch.object(materials, "UPLOAD_DIR", uploads), patch.object(materials, "_embeddings", return_value=Mock(embed_query=Mock(return_value=[0.0, 1.0]))), patch.object(materials, "_milvus", return_value=Mock()):
-                connection = materials._registry()
+            with patch.object(materials.registry_store, "REGISTRY_PATH", registry_path), patch.object(materials, "UPLOAD_DIR", uploads), patch.object(materials, "get_embeddings", return_value=Mock(embed_query=Mock(return_value=[0.0, 1.0]))), patch.object(materials, "get_vector_client", return_value=Mock()):
+                connection = materials.open_registry()
                 connection.execute("INSERT INTO materials VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
                     "migration-test", "测试资料", "上传/测试", "upload",
                     f"/Users/example/old-project/uploads/{filename}", "hash", 1, "2026-01-01",

@@ -5,6 +5,9 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from app.services import review as review_service
+from app.services import conversations as conversation_service
+from app.api.routes import system as system_routes
 from app import main
 
 
@@ -15,7 +18,7 @@ class ReviewApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_web_only_request_reaches_agent_with_switch_enabled(self):
         answer = {"answer": "网上资料", "sources": [{"type": "web", "url": "https://example.com", "text": "摘要"}], "trace": []}
-        with patch.object(main, "DB_URL", ""), patch.object(main, "TAVILY_API_KEY", "测试占位"), patch.object(main, "list_materials", return_value=[]), patch.object(main, "review", new=AsyncMock(return_value=answer)) as review:
+        with patch.object(review_service, "DB_URL", ""), patch.object(conversation_service, "DB_URL", ""), patch.object(review_service, "TAVILY_API_KEY", "测试占位"), patch.object(review_service, "list_materials", return_value=[]), patch.object(review_service, "review", new=AsyncMock(return_value=answer)) as review:
             response = await self.client.post("/api/review", json={"question": "查询最新官方文档", "material_ids": [], "web_search_enabled": True})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(review.call_args.kwargs["web_search_enabled"])
@@ -23,7 +26,7 @@ class ReviewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["sources"][0]["type"], "web")
 
     async def test_missing_key_or_empty_scope_does_not_create_history_or_run_agent(self):
-        with patch.object(main, "TAVILY_API_KEY", ""), patch.object(main, "begin_turn", new=AsyncMock()) as begin, patch.object(main, "review", new=AsyncMock()) as review:
+        with patch.object(review_service, "TAVILY_API_KEY", ""), patch.object(review_service, "begin_turn", new=AsyncMock()) as begin, patch.object(review_service, "review", new=AsyncMock()) as review:
             missing_key = await self.client.post("/api/review", json={"question": "测试", "web_search_enabled": True})
             empty_scope = await self.client.post("/api/review", json={"question": "测试"})
         self.assertEqual(missing_key.status_code, 400)
@@ -33,7 +36,7 @@ class ReviewApiTests(unittest.IsolatedAsyncioTestCase):
         review.assert_not_awaited()
 
     async def test_health_only_exposes_search_availability(self):
-        with patch.object(main, "TAVILY_API_KEY", "不得出现在接口里的密钥"), patch.object(main, "material_counts", return_value={}):
+        with patch.object(system_routes, "TAVILY_API_KEY", "不得出现在接口里的密钥"), patch.object(system_routes, "material_counts", return_value={}):
             response = await self.client.get("/api/health")
         self.assertTrue(response.json()["web_search_configured"])
         self.assertNotIn("不得出现在接口里的密钥", response.text)

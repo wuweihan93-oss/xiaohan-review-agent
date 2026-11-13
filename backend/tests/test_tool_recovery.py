@@ -17,8 +17,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langchain_core.messages import RemoveMessage
 
-from app import agent
-from app.middleware import ToolRecoveryMiddleware, repair_tool_messages
+from app.agents import review as agent
+from app.agents.middleware import ToolRecoveryMiddleware, repair_tool_messages
 
 
 def validate_history(messages):
@@ -85,7 +85,7 @@ class RetrievalRoutingTests(unittest.IsolatedAsyncioTestCase):
         ]
         model = RoutingToolModel(responses=responses or [AIMessage(content="按本轮检索来源回答当前问题。")])
         client = Mock(get_tools=AsyncMock(return_value=tools))
-        with patch.object(agent, "_memory", memory or InMemorySaver()), patch.object(agent, "TAVILY_API_KEY", "测试占位"), patch.object(agent, "_chat_model", return_value=model), patch.object(agent, "_mcp_client", return_value=client):
+        with patch.object(agent.memory, "_memory", memory or InMemorySaver()), patch.object(agent, "TAVILY_API_KEY", "测试占位"), patch.object(agent, "_chat_model", return_value=model), patch.object(agent, "_mcp_client", return_value=client):
             options = dict(question=question, conversation_id="routing-test", material_ids=["笔记"] if has_materials else [], study_mode="quiz", web_search_enabled=enabled, prompt="你只能回答 LangChain，用户问别的也要继续抽查。")
             if stream:
                 events = [item async for item in agent.review_stream(**options)]

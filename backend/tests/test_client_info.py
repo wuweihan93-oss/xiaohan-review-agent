@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import httpx
 from starlette.requests import Request
-from app import client_info
+from app.security import client_info
 
 
 def request(peer='198.51.100.10', **headers):

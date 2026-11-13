@@ -12,9 +12,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from psycopg import AsyncConnection
 
-from app import admin, main
-from app.admin_password import hash_password, verify_password
-from app.config import DB_URL
+from app.services import review as review_service
+from app import main
+from app.security import admin
+from app.security.passwords import hash_password, verify_password
+from app.core.config import DB_URL
 
 PASSWORD = 'test-only-password-9281'
 PASSWORD_HASH = hash_password(PASSWORD)
@@ -102,7 +104,7 @@ class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
         token = self.client.cookies.get(admin.COOKIE_NAME)
         self.assertNotIn(token, response.text)
         self.assertNotEqual(create.call_args.args[0], token)
-        self.assertEqual(create.call_args.args[0], admin._token_hash(token))
+        self.assertEqual(create.call_args.args[0], admin.token_hash(token))
         self.assertEqual(create.call_args.args[1], response.json()['csrf_token'])
         header = response.headers['set-cookie']
         for flag in ('HttpOnly', 'SameSite=strict', 'Path=/api/admin', 'Max-Age=28800'):
@@ -145,7 +147,7 @@ class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
             remove.assert_not_awaited()
             allowed = await self.client.post('/api/admin/logout', headers={'X-CSRF-Token': 'csrf', 'Origin': 'http://test'})
             self.assertEqual(allowed.status_code, 200)
-            remove.assert_awaited_once_with(admin._token_hash('a' * 64))
+            remove.assert_awaited_once_with(admin.token_hash('a' * 64))
         with patch.object(admin.admin_store, 'read_session', new=AsyncMock(return_value=None)):
             self.assertEqual((await self.client.get('/api/admin/overview')).status_code, 401)
 
@@ -159,7 +161,7 @@ class AdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.lifespan = main.app.router.lifespan_context(main.app)
         await self.lifespan.__aenter__()
         self.clients = [httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://test') for _ in range(3)]
-        self.patches = [patch.object(admin, 'ADMIN_USERNAME', 'admin'), patch.object(admin, 'ADMIN_PASSWORD_HASH', PASSWORD_HASH), patch.object(main, 'list_materials', return_value=[{'id': 'study'}]), patch.object(main, 'review', new=AsyncMock(return_value={'answer': '隔离测试回答', 'sources': [], 'trace': []}))]
+        self.patches = [patch.object(admin, 'ADMIN_USERNAME', 'admin'), patch.object(admin, 'ADMIN_PASSWORD_HASH', PASSWORD_HASH), patch.object(review_service, 'list_materials', return_value=[{'id': 'study'}]), patch.object(review_service, 'review', new=AsyncMock(return_value={'answer': '隔离测试回答', 'sources': [], 'trace': []}))]
         for item in self.patches:
             item.start()
         for index in range(2):
@@ -171,7 +173,7 @@ class AdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
         response = await self.admin.post('/api/admin/login', json={'username': 'admin', 'password': PASSWORD}, headers={'X-Admin-Request': '1'})
         self.assertEqual(response.status_code, 200)
         self.csrf = response.json()['csrf_token']
-        self.token_hash = admin._token_hash(self.admin.cookies.get(admin.COOKIE_NAME))
+        self.token_hash = admin.token_hash(self.admin.cookies.get(admin.COOKIE_NAME))
 
     async def asyncTearDown(self):
         for client in self.clients:
@@ -217,7 +219,7 @@ class AdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved['messages'][-2]['content'], '新增一轮复盘')
 
     async def test_table_pairs_questions_answers_and_records_ip_without_guessing_legacy_ip(self):
-        from app.conversations import begin_turn, finish_turn
+        from app.repositories.conversations import begin_turn, finish_turn
         detail = (await self.admin.get(f'/api/admin/conversations/{self.ids[0]}')).json()['conversation']
         owner = detail['visitor_id']
         table = (await self.admin.get('/api/admin/turns', params={'visitor_id': owner})).json()
