@@ -1,0 +1,132 @@
+"""工具异常与中断恢复，保证发送给模型的工具调用和结果成对出现。"""
+
+import logging
+from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    RemoveMessage,
+    ToolMessage,
+)
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+logger = logging.getLogger(__name__)
+
+
+class RetrievalRoutingMiddleware(AgentMiddleware):
+    """每轮先检索选中资料；无资料或资料检索为空、失败时强制使用可用的网页工具。"""
+
+    def __init__(self, *, has_materials: bool, web_search_enabled: bool):
+        self.has_materials = has_materials
+        self.web_search_enabled = web_search_enabled
+
+    async def awrap_model_call(self, request, handler):
+        messages = request.messages
+        start = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[i], HumanMessage)
+            ),
+            -1,
+        )
+        current = messages[start + 1 :]
+        results = [message for message in current if isinstance(message, ToolMessage)]
+        local_results = [
+            message for message in results if message.name == "search_study_materials"
+        ]
+        searched_web = any(message.name == "search_web" for message in results)
+        target = None
+        if self.has_materials and not local_results:
+            target = "search_study_materials"
+        elif self.web_search_enabled and not searched_web:
+            # 使用统一的解析器识别有效资料片段；错误和空返回不作为已找到答案。
+            from app.agents.messages import tool_sources
+
+            if not self.has_materials or not any(
+                source["text"].strip()
+                for message in local_results
+                for source in tool_sources(message)
+            ):
+                target = "search_web"
+        # 非空片段是否相关由模型判断；系统提示词要求资料不足时继续调用 search_web。
+        names = {
+            tool.get("name") if isinstance(tool, dict) else tool.name
+            for tool in request.tools
+        }
+        if target in names:
+            request = request.override(
+                tool_choice={"type": "function", "function": {"name": target}}
+            )
+        return await handler(request)
+
+
+def repair_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """保留问答和成功的工具结果；为中断调用补错误结果，并移除游离或重复返回。"""
+    repaired = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        index += 1
+        if isinstance(message, ToolMessage):
+            # 合法的工具返回会在下方随它所属的 AI 消息一起处理。
+            continue
+        repaired.append(message)
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            continue
+
+        calls = {call["id"]: call for call in message.tool_calls}
+        answered = set()
+        while index < len(messages) and isinstance(messages[index], ToolMessage):
+            result = messages[index]
+            index += 1
+            if result.tool_call_id in calls and result.tool_call_id not in answered:
+                repaired.append(result)
+                answered.add(result.tool_call_id)
+        for call_id, call in calls.items():
+            if call_id not in answered:
+                repaired.append(
+                    ToolMessage(
+                        content="上一次工具调用被中断，没有获得结果。请按本轮可用工具重新检索，不要把这条错误提示当作知识依据。",
+                        tool_call_id=call_id,
+                        name=call["name"],
+                        status="error",
+                    )
+                )
+    return repaired
+
+
+class ToolRecoveryMiddleware(AgentMiddleware):
+    async def abefore_model(self, state, runtime) -> dict[str, Any] | None:
+        messages = state["messages"]
+        repaired = repair_tool_messages(messages)
+        if repaired == messages:
+            return None
+        # 原位追加无法修复已夹在历史问答中的缺失结果，必须按顺序更新消息状态。
+        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *repaired]}
+
+    async def awrap_tool_call(self, request, handler):
+        try:
+            return await handler(request)
+        except Exception as exc:
+            name = request.tool_call["name"]
+            logger.warning("工具执行失败（%s，%s）", name, type(exc).__name__)
+            description = (
+                "联网搜索失败，本次没有取得网页结果。若有学习资料可以继续围绕资料讲解，但不能声称已联网验证最新信息。"
+                if name == "search_web"
+                else "学习资料工具执行失败，本次没有取得资料检索结果。"
+            )
+            # 让失败也产生匹配的 ToolMessage，避免整个图停在悬空的 tool_calls 上。
+            return ToolMessage(
+                content=(
+                    description
+                    + "可以重试一次；若仍失败，请告诉用户对应检索服务暂时不可用，稍后再试。"
+                    "不要编造检索内容。"
+                ),
+                tool_call_id=request.tool_call["id"],
+                name=request.tool_call["name"],
+                status="error",
+            )
